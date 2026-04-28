@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import gzip
 import glob
 import json
 import os
@@ -12,6 +13,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +23,7 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
 SERIAL_BAUD = 115200
 LOG_CAPACITY = 2000
+LOG_DIR_NAME = "mpy-bridge-logs"
 COMMAND_TIMEOUT_SEC = 20
 DEVICE_COMMAND_TIMEOUT_SEC = 60
 SERIAL_WRITE_TIMEOUT_SEC = 5
@@ -63,6 +66,9 @@ class CommandRunner:
             with self._lock:
                 self._processes.discard(process)
 
+        if argv and argv[0] == "mpremote" and stderr:
+            STATE.append_log_event("MPREMOTE STDERR:\n{}".format(stderr.rstrip()))
+
         if process.returncode != 0:
             raise RuntimeError(
                 "command failed: {}\nstdout:\n{}\nstderr:\n{}".format(
@@ -96,6 +102,8 @@ class MonitorState:
         self._stop_event = None
         self._port = None
         self._next_request_id = 1
+        self._install_log_path = None
+        self._install_log_sequence = 0
 
     def snapshot(self):
         with self._lock:
@@ -115,9 +123,48 @@ class MonitorState:
         with self._lock:
             self._cursor += 1
             self._lines.append((self._cursor, line))
+            self._write_log_line_locked("SERIAL LINE: " + line)
+
+    def append_log_event(self, message):
+        with self._lock:
+            self._write_log_line_locked(message)
+
+    def append_serial_bytes(self, direction, data):
+        self.append_log_event("SERIAL {}: {}".format(direction, data.hex()))
+
+    def _write_log_line_locked(self, message):
+        if self._install_log_path is None:
+            return
+        encoded = (message + "\n").encode("utf-8")
+        with open(self._install_log_path, "ab") as handle:
+            handle.write(gzip.compress(encoded))
+
+    def start_install_log(self, repo_root):
+        with self._lock:
+            self._close_install_log_locked()
+            self._install_log_sequence += 1
+            log_dir = os.path.join(repo_root, LOG_DIR_NAME)
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = "install-{}-{:04d}.log.gz".format(stamp, self._install_log_sequence)
+            path = os.path.join(log_dir, filename)
+            open(path, "ab").close()
+            self._install_log_path = path
+            self._write_log_line_locked("INSTALL LOG START: {}".format(stamp))
+            return path
+
+    def close_install_log(self):
+        with self._lock:
+            self._close_install_log_locked()
+
+    def _close_install_log_locked(self):
+        if self._install_log_path is not None:
+            self._write_log_line_locked("INSTALL LOG END")
+            self._install_log_path = None
 
     def append_response(self, payload):
         with self._response_condition:
+            self._write_log_line_locked("RUNTIME RESPONSE: {}".format(json.dumps(payload)))
             self._responses.append(payload)
             self._response_condition.notify_all()
 
@@ -131,7 +178,7 @@ class MonitorState:
             items = items[-tail:]
         return [line for _, line in items], cursor
 
-    def stop_monitor(self):
+    def stop_monitor(self, close_log=True):
         with self._lock:
             stop_event = self._stop_event
             serial_fd = self._serial_fd
@@ -149,11 +196,13 @@ class MonitorState:
                 os.close(serial_fd)
             except OSError:
                 pass
+        if close_log:
+            self.close_install_log()
         with self._response_condition:
             self._response_condition.notify_all()
 
-    def start_monitor(self, port, repo_root):
-        self.stop_monitor()
+    def start_monitor(self, port, repo_root, close_log=True):
+        self.stop_monitor(close_log=close_log)
         configure_serial_port(port, repo_root)
         serial_fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         stop_event = threading.Event()
@@ -186,6 +235,7 @@ class MonitorState:
                 continue
             if written <= 0:
                 raise RuntimeError("failed to write to serial monitor")
+            self.append_serial_bytes("TX", data[total_written: total_written + written])
             total_written += written
 
     def next_request_id(self):
@@ -217,6 +267,7 @@ class MonitorState:
                 if not ready:
                     continue
                 chunk = os.read(serial_fd, 256)
+                self.append_serial_bytes("RX", chunk)
             except BlockingIOError:
                 continue
             except OSError as exc:
@@ -271,7 +322,20 @@ def configure_serial_port(port, repo_root):
 
 
 def run_command(argv, cwd):
-    return RUNNER.run(argv, cwd)
+    should_log = bool(argv) and argv[0] == "mpremote"
+    if should_log:
+        STATE.append_log_event("MPREMOTE RUN: {}".format(json.dumps(argv)))
+    try:
+        stdout = RUNNER.run(argv, cwd)
+    except Exception as exc:
+        if should_log:
+            STATE.append_log_event("MPREMOTE ERROR: {}".format(str(exc)))
+        raise
+    if should_log:
+        if stdout:
+            STATE.append_log_event("MPREMOTE STDOUT:\n{}".format(stdout.rstrip()))
+        STATE.append_log_event("MPREMOTE OK")
+    return stdout
 
 
 def micropython_files(repo_root):
@@ -390,19 +454,25 @@ class Handler(BaseHTTPRequestHandler):
         repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
+        STATE.start_install_log(repo_root)
         if monitor:
             STATE.clear_logs()
         include_runtime = bool(body.get("debug_runtime"))
-        result = install_files(repo_root, port, reset=(not monitor) and (not include_runtime))
-        if include_runtime:
-            runtime_result = install_debug_runtime(port, repo_root, reset=not monitor)
-            result["files"].extend(runtime_result["files"])
-            result["listing"] = runtime_result["listing"]
+        try:
+            result = install_files(repo_root, port, reset=(not monitor) and (not include_runtime))
+            if include_runtime:
+                runtime_result = install_debug_runtime(port, repo_root, reset=not monitor)
+                result["files"].extend(runtime_result["files"])
+                result["listing"] = runtime_result["listing"]
+        except Exception:
+            STATE.close_install_log()
+            raise
         if not monitor:
             result["monitoring"] = False
             result["port"] = port
+            STATE.close_install_log()
             return {"ok": True, **result}
-        STATE.start_monitor(port, repo_root)
+        STATE.start_monitor(port, repo_root, close_log=False)
         time.sleep(0.2)
         STATE.write_bytes(b"\x03\x02\x04")
         time.sleep(0.5)
@@ -421,14 +491,20 @@ class Handler(BaseHTTPRequestHandler):
         repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
+        STATE.start_install_log(repo_root)
         if monitor:
             STATE.clear_logs()
-        result = install_debug_runtime(port, repo_root, reset=not monitor)
+        try:
+            result = install_debug_runtime(port, repo_root, reset=not monitor)
+        except Exception:
+            STATE.close_install_log()
+            raise
         if not monitor:
             result["monitoring"] = False
             result["port"] = port
+            STATE.close_install_log()
             return {"ok": True, **result}
-        STATE.start_monitor(port, repo_root)
+        STATE.start_monitor(port, repo_root, close_log=False)
         time.sleep(0.2)
         STATE.write_bytes(b"\x03\x02\x04")
         time.sleep(0.5)
@@ -483,6 +559,7 @@ class Handler(BaseHTTPRequestHandler):
         payload["request_id"] = request_id
         encoded = json.dumps(payload).encode("utf-8")
         frame = FRAME_PREFIX_BYTES + str(len(encoded)).encode("utf-8") + b"\n" + encoded + b"\n"
+        STATE.append_log_event("RUNTIME REQUEST: {}".format(json.dumps(payload)))
         STATE.write_bytes(frame)
         return STATE.wait_for_response(request_id, timeout_sec)
 
@@ -553,7 +630,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        print(fmt % args)
+        message = fmt % args
+        if '"GET /logs?' in message:
+            return
+        print(message)
 
 
 def parse_int(value):
