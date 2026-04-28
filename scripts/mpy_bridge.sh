@@ -49,6 +49,7 @@ case "$action" in
     ;;
   serve)
     exec python3 "$SCRIPT_DIR"/mpy_debug_server.py "${@:2}"
+    ;;
   health)
     exec curl -sS "${BASE_URL}/health"
     ;;

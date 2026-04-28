@@ -23,6 +23,7 @@ SERIAL_BAUD = 115200
 LOG_CAPACITY = 2000
 COMMAND_TIMEOUT_SEC = 20
 DEVICE_COMMAND_TIMEOUT_SEC = 60
+SERIAL_WRITE_TIMEOUT_SEC = 5
 FRAME_PREFIX = "@@FRAME@@ "
 FRAME_PREFIX_BYTES = FRAME_PREFIX.encode("utf-8")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -173,11 +174,14 @@ class MonitorState:
             serial_fd = self._serial_fd
         if serial_fd is None:
             raise RuntimeError("monitor is not running")
+        deadline = time.monotonic() + SERIAL_WRITE_TIMEOUT_SEC
         total_written = 0
         while total_written < len(data):
             try:
                 written = os.write(serial_fd, data[total_written:])
             except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("timed out writing to serial monitor")
                 time.sleep(0.01)
                 continue
             if written <= 0:
@@ -584,7 +588,6 @@ def parse_args():
     parser.add_argument("--host", default=DEFAULT_HTTP_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     parser.add_argument("--serial-port", type=str, default=None)
-    parser.add_argument("--repo-root", type=str, default=None)
     return parser.parse_args()
 
 
@@ -592,9 +595,9 @@ def main():
     args = parse_args()
     serial_port = args.serial_port or os.getenv("SERIAL_PORT")
     if serial_port is None:
-        print("Usage: python3 debug_bridge/mpy_debug_server.py --serial-port /dev/cu.usbmodem...")
+        print("Usage: python3 mpy_debug_server.py --serial-port /dev/cu.usbmodem...")
         return
-    repo_root = os.path.abspath(args.repo_root or os.getenv("MPY_PROJECT_ROOT") or os.getcwd())
+    repo_root = os.path.abspath(os.getenv("MPY_PROJECT_ROOT") or os.getcwd())
     if not os.path.isdir(repo_root):
         print("repo root does not exist: {}".format(repo_root))
         return
