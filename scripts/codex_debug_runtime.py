@@ -45,7 +45,7 @@ class RuntimeShell:
 
     def _read_chunk(self):
         try:
-            chunk = sys.stdin.read(128)
+            chunk = sys.stdin.read(1)
         except Exception:
             return b""
         if chunk is None:
@@ -61,7 +61,7 @@ class RuntimeShell:
                 if newline_index < 0:
                     return
                 line = bytes(self.buffer[:newline_index]).rstrip(b"\r")
-                del self.buffer[:newline_index + 1]
+                self.buffer = bytearray(self.buffer[newline_index + 1:])
                 if not line:
                     continue
                 if not line.startswith(FRAME_PREFIX_BYTES):
@@ -82,9 +82,9 @@ class RuntimeShell:
                 return
 
             payload_bytes = bytes(self.buffer[:self.expected_payload_length])
-            del self.buffer[:self.expected_payload_length]
+            self.buffer = bytearray(self.buffer[self.expected_payload_length:])
             if self.buffer[:1] == b"\n":
-                del self.buffer[:1]
+                self.buffer = bytearray(self.buffer[1:])
             self.expected_payload_length = None
 
             try:

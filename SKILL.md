@@ -7,7 +7,7 @@ Use this bridge when you need host-side install/monitor/debug access to the Micr
 Use the bundled CLI. It owns both server startup and client commands:
 
 ```bash
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh help
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh help
 ```
 
 ## Start Server
@@ -15,7 +15,7 @@ Use the bundled CLI. It owns both server startup and client commands:
 Start the server from the MicroPython project directory. The current working directory is the project root.
 
 ```bash
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh serve --serial-port /dev/cu.usbmodem1101
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh serve --serial-port /dev/cu.usbmodem1101
 ```
 
 Use the `/dev/cu.*` serial device on macOS when available. Use `MPY_PROJECT_ROOT=/path/to/project` only when starting from a different directory.
@@ -31,16 +31,16 @@ The device protocol is framed JSON over serial. Use `call` for exported app func
 Use the CLI help as the source of truth:
 
 ```bash
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh help
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh help
 ```
 
 Common commands:
 
 ```bash
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh install-and-monitor --runtime
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh state
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh call app.get_state
-/Users/berik/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh logs --tail 50
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh install-and-monitor --runtime
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh state
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh call app.get_state
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh logs --tail 50
 ```
 
 ## Guidance
