@@ -1,6 +1,6 @@
 {
   "name": "micropython-debug-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Direct MCP access to connected MicroPython serial devices",
   "author": {
     "name": "Berik Vissers"

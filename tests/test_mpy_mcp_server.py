@@ -153,6 +153,140 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(device_thread.is_alive())
 
 
+class DeviceTakeoverTests(unittest.TestCase):
+    @mock.patch.object(SERVER.os, "open")
+    def test_takeover_open_failure_preserves_port_ownership_evidence(
+        self, open_device
+    ):
+        open_device.side_effect = PermissionError("device busy")
+
+        with self.assertRaises(SERVER.DeviceControlError) as raised:
+            SERVER.interrupt_running_program("/dev/cu.test")
+
+        diagnostics = raised.exception.diagnostics
+        self.assertFalse(diagnostics["ok"])
+        self.assertEqual(diagnostics["failure_stage"], "open")
+        self.assertEqual(diagnostics["port"], "/dev/cu.test")
+        self.assertIn("device busy", diagnostics["error"])
+
+    def test_repeated_interrupts_leave_evidence_of_friendly_repl(self):
+        master_fd, slave_fd = pty.openpty()
+        slave_path = os.ttyname(slave_fd)
+        stop = threading.Event()
+
+        def device():
+            received = bytearray()
+            responded = False
+            while not stop.is_set():
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                if not ready:
+                    continue
+                received.extend(os.read(master_fd, 128))
+                if not responded and received.count(3) >= 2:
+                    os.write(master_fd, b"KeyboardInterrupt\r\n>>> ")
+                    responded = True
+
+        device_thread = threading.Thread(target=device)
+        device_thread.start()
+        try:
+            result = SERVER.interrupt_running_program(slave_path)
+        finally:
+            stop.set()
+            device_thread.join(timeout=2)
+            os.close(master_fd)
+            os.close(slave_fd)
+
+        self.assertTrue(result["friendly_prompt_seen"])
+        self.assertTrue(result["keyboard_interrupt_seen"])
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(
+            result["transmissions_hex"].count(b"\r\x03".hex()),
+            SERVER.SERIAL_TAKEOVER_ATTEMPTS,
+        )
+
+    @mock.patch.object(SERVER, "interrupt_running_program")
+    def test_mpremote_failure_retains_takeover_and_command_evidence(
+        self, interrupt
+    ):
+        interrupt.return_value = {
+            "port": "/dev/cu.test",
+            "rx_hex": "3e3e3e20",
+            "rx_text": ">>> ",
+            "friendly_prompt_seen": True,
+        }
+        controller = SERVER.DeviceController()
+        controller.runner.run = mock.Mock(
+            side_effect=RuntimeError("could not enter raw repl")
+        )
+        self.addCleanup(controller.close)
+
+        with self.assertRaises(SERVER.DeviceControlError) as raised:
+            controller._run_mpremote(
+                "/dev/cu.test",
+                ["connect", "/dev/cu.test", "reset"],
+            )
+
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(diagnostics["takeover"]["rx_text"], ">>> ")
+        self.assertEqual(
+            diagnostics["command"],
+            ["mpremote", "connect", "/dev/cu.test", "reset"],
+        )
+        self.assertFalse(diagnostics["mpremote_ok"])
+        self.assertIn("could not enter raw repl", diagnostics["mpremote_error"])
+        self.assertEqual(
+            controller.status({})["last_device_control"],
+            diagnostics,
+        )
+
+    @mock.patch.object(SERVER, "interrupt_running_program")
+    def test_takeover_failure_is_retained_without_starting_mpremote(
+        self, interrupt
+    ):
+        interrupt.side_effect = SERVER.DeviceControlError(
+            "serial takeover failed during open",
+            {
+                "ok": False,
+                "port": "/dev/cu.test",
+                "failure_stage": "open",
+                "error": "device busy",
+            },
+        )
+        controller = SERVER.DeviceController()
+        controller.runner.run = mock.Mock()
+        self.addCleanup(controller.close)
+
+        with self.assertRaises(SERVER.DeviceControlError) as raised:
+            controller._run_mpremote(
+                "/dev/cu.test",
+                ["connect", "/dev/cu.test", "reset"],
+            )
+
+        controller.runner.run.assert_not_called()
+        self.assertEqual(
+            raised.exception.diagnostics["takeover"]["failure_stage"],
+            "open",
+        )
+        self.assertEqual(
+            controller.status({})["last_device_control"],
+            raised.exception.diagnostics,
+        )
+
+    def test_mcp_error_result_exposes_structured_diagnostics(self):
+        error = SERVER.DeviceControlError(
+            "control failed",
+            {"takeover": {"rx_hex": "00ff"}},
+        )
+
+        result = SERVER._error_result(error)
+
+        self.assertTrue(result["isError"])
+        self.assertEqual(
+            result["structuredContent"]["diagnostics"]["takeover"]["rx_hex"],
+            "00ff",
+        )
+
+
 class MCPProtocolTests(unittest.TestCase):
     def setUp(self):
         self.controller = SERVER.DeviceController()

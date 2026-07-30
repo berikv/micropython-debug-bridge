@@ -48,6 +48,16 @@ then verifies that the MCP process can actually open and exclusively own it.
 - Use `evaluate_runtime` only for focused debugging. It can mutate MCU state.
 - Before any runtime tool, confirm `monitoring: true` in `get_bridge_status`.
   If monitoring is false, call `start_serial_monitor` first.
+- On `install_files`, `install_debug_runtime`, `remove_debug_runtime`, or
+  `reset_device` raw-REPL failure, check that `get_bridge_status.server.version`
+  is at least 1.0.1, then inspect the returned `diagnostics` and retained
+  `last_device_control`. Report `takeover.transmissions_hex`, `rx_hex`,
+  `rx_text`, `friendly_prompt_seen`, `keyboard_interrupt_seen`, `command`,
+  `mpremote_ok`, and `mpremote_error`.
+- When `mpremote_ok` is false, do not claim the requested MCU operation ran and
+  do not automatically retry, reset, or restart monitoring. If no friendly
+  prompt was seen, ask the human for an external hardware reset. Otherwise,
+  report the `mpremote` handoff failure and preserve the evidence for diagnosis.
 
 `install_files`, `install_debug_runtime`, `remove_debug_runtime`,
 `reset_device`, and `evaluate_runtime` modify device state. Explain the intended

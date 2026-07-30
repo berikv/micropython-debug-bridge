@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 
 SERVER_NAME = "micropython-debug-bridge"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.0.1"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {
     "2024-11-05",
@@ -35,6 +35,9 @@ LOG_CAPACITY = 2000
 COMMAND_TIMEOUT_SEC = 20
 DEVICE_COMMAND_TIMEOUT_SEC = 60
 SERIAL_WRITE_TIMEOUT_SEC = 5
+SERIAL_TAKEOVER_ATTEMPTS = 3
+SERIAL_TAKEOVER_READ_SEC = 0.25
+SERIAL_TAKEOVER_MAX_BYTES = 4096
 FRAME_PREFIX = "@@FRAME@@ "
 FRAME_PREFIX_BYTES = FRAME_PREFIX.encode("utf-8")
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -63,6 +66,9 @@ def _result(value: dict[str, Any]) -> dict[str, Any]:
 
 def _error_result(exc: Exception) -> dict[str, Any]:
     value = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+    diagnostics = getattr(exc, "diagnostics", None)
+    if diagnostics is not None:
+        value["diagnostics"] = diagnostics
     return {
         "content": [{"type": "text", "text": _json_text(value)}],
         "structuredContent": value,
@@ -164,6 +170,117 @@ def configure_serial_fd(serial_fd: int) -> None:
     attributes[4] = termios.B115200
     attributes[5] = termios.B115200
     termios.tcsetattr(serial_fd, termios.TCSANOW, attributes)
+
+
+class DeviceControlError(RuntimeError):
+    def __init__(self, message: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _read_serial_evidence(serial_fd: int, duration_sec: float) -> bytes:
+    deadline = time.monotonic() + duration_sec
+    evidence = bytearray()
+    while time.monotonic() < deadline and len(evidence) < SERIAL_TAKEOVER_MAX_BYTES:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([serial_fd], [], [], remaining)
+        if not ready:
+            break
+        try:
+            chunk = os.read(
+                serial_fd,
+                min(512, SERIAL_TAKEOVER_MAX_BYTES - len(evidence)),
+            )
+        except BlockingIOError:
+            continue
+        if not chunk:
+            break
+        evidence.extend(chunk)
+    return bytes(evidence)
+
+
+def _write_serial_bytes(serial_fd: int, data: bytes) -> None:
+    deadline = time.monotonic() + SERIAL_WRITE_TIMEOUT_SEC
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(serial_fd, data[offset:])
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out writing serial takeover sequence")
+            time.sleep(0.01)
+            continue
+        if written <= 0:
+            raise RuntimeError("failed to write serial takeover sequence")
+        offset += written
+
+
+def interrupt_running_program(port: str) -> dict[str, Any]:
+    """Interrupt a running app and retain evidence before mpremote opens the TTY."""
+    started = time.monotonic()
+    serial_fd: int | None = None
+    evidence = bytearray()
+    transmissions: list[str] = []
+    stage = "open"
+    try:
+        serial_fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        stage = "configure"
+        configure_serial_fd(serial_fd)
+        stage = "drain"
+        evidence.extend(_read_serial_evidence(serial_fd, 0.05))
+
+        # mpremote sends only one Ctrl-C before entering raw REPL. Some busy
+        # applications need repeated interrupts before the friendly prompt is
+        # available, so leave the MCU there before handing over the device.
+        stage = "interrupt"
+        for _ in range(SERIAL_TAKEOVER_ATTEMPTS):
+            payload = b"\r\x03"
+            _write_serial_bytes(serial_fd, payload)
+            transmissions.append(payload.hex())
+            evidence.extend(
+                _read_serial_evidence(serial_fd, SERIAL_TAKEOVER_READ_SEC)
+            )
+
+        # If a previous client left raw REPL active, Ctrl-B returns to friendly
+        # REPL. A final Ctrl-C makes the handoff state deterministic.
+        stage = "normalize"
+        for payload in (b"\r\x02", b"\r\x03"):
+            _write_serial_bytes(serial_fd, payload)
+            transmissions.append(payload.hex())
+            evidence.extend(
+                _read_serial_evidence(serial_fd, SERIAL_TAKEOVER_READ_SEC)
+            )
+    except Exception as exc:
+        captured = bytes(evidence[-SERIAL_TAKEOVER_MAX_BYTES:])
+        raise DeviceControlError(
+            f"serial takeover failed during {stage}: {exc}",
+            {
+                "ok": False,
+                "port": port,
+                "failure_stage": stage,
+                "error": str(exc),
+                "elapsed_sec": round(time.monotonic() - started, 3),
+                "transmissions_hex": transmissions,
+                "rx_hex": captured.hex(),
+                "rx_text": captured.decode("utf-8", errors="replace"),
+            },
+        ) from exc
+    finally:
+        if serial_fd is not None:
+            os.close(serial_fd)
+
+    captured = bytes(evidence[-SERIAL_TAKEOVER_MAX_BYTES:])
+    text = captured.decode("utf-8", errors="replace")
+    return {
+        "ok": True,
+        "port": port,
+        "elapsed_sec": round(time.monotonic() - started, 3),
+        "transmissions_hex": transmissions,
+        "rx_hex": captured.hex(),
+        "rx_text": text,
+        "friendly_prompt_seen": ">>>" in text,
+        "keyboard_interrupt_seen": "KeyboardInterrupt" in text,
+    }
 
 
 class CommandRunner:
@@ -490,6 +607,7 @@ class DeviceController:
         self.runner = CommandRunner()
         self._operation_lock = threading.RLock()
         self._selected_port = os.environ.get("MPY_SERIAL_PORT")
+        self._last_device_control: dict[str, Any] | None = None
 
     def close(self) -> None:
         self.runner.kill_active()
@@ -542,14 +660,48 @@ class DeviceController:
             "selected_port": self._selected_port,
             "selected_port_available": selected_available,
             "mpremote": shutil.which("mpremote"),
+            "last_device_control": self._last_device_control,
             **self.monitor.snapshot(),
         }
 
-    def _run_mpremote(self, argv: list[str]) -> str:
-        return self.runner.run(["mpremote", *argv])
+    def _run_mpremote(self, port: str, argv: list[str]) -> str:
+        command = ["mpremote", *argv]
+        try:
+            takeover = interrupt_running_program(port)
+        except DeviceControlError as exc:
+            diagnostics = {
+                "takeover": exc.diagnostics,
+                "command": command,
+                "mpremote_ok": False,
+                "mpremote_error": "not started because serial takeover failed",
+            }
+            self._last_device_control = diagnostics
+            raise DeviceControlError(
+                "serial takeover failed before mpremote could start; inspect "
+                "diagnostics.takeover for port and handshake evidence",
+                diagnostics,
+            ) from exc
+        diagnostics = {
+            "takeover": takeover,
+            "command": command,
+        }
+        self._last_device_control = diagnostics
+        try:
+            stdout = self.runner.run(["mpremote", *argv])
+        except Exception as exc:
+            diagnostics["mpremote_ok"] = False
+            diagnostics["mpremote_error"] = str(exc)
+            raise DeviceControlError(
+                "mpremote failed after the bridge sent repeated interrupts; "
+                "inspect diagnostics.takeover for the serial handshake evidence",
+                diagnostics,
+            ) from exc
+        diagnostics["mpremote_ok"] = True
+        diagnostics["mpremote_stdout"] = stdout
+        return stdout
 
     def _reset(self, port: str) -> None:
-        self._run_mpremote(["connect", port, "reset"])
+        self._run_mpremote(port, ["connect", port, "reset"])
 
     def _install_paths(self, files: Any, port: str) -> dict[str, Any]:
         if not isinstance(files, list) or not files:
@@ -561,8 +713,10 @@ class DeviceController:
             if not os.path.isfile(item):
                 raise ValueError(f"install file does not exist: {item}")
             checked.append(item)
-        self._run_mpremote(["connect", port, "fs", "cp", *checked, ":"])
-        listing = self._run_mpremote(["connect", port, "fs", "ls"])
+        self._run_mpremote(
+            port, ["connect", port, "fs", "cp", *checked, ":"]
+        )
+        listing = self._run_mpremote(port, ["connect", port, "fs", "ls"])
         return {
             "files": [os.path.basename(item) for item in checked],
             "listing": listing,
@@ -570,9 +724,10 @@ class DeviceController:
 
     def _install_runtime(self, port: str) -> dict[str, Any]:
         self._run_mpremote(
+            port,
             ["connect", port, "fs", "cp", str(DEBUG_RUNTIME_PATH), ":"]
         )
-        listing = self._run_mpremote(["connect", port, "fs", "ls"])
+        listing = self._run_mpremote(port, ["connect", port, "fs", "ls"])
         return {"files": [DEBUG_RUNTIME_NAME], "listing": listing}
 
     def _begin_monitor(self, port: str) -> tuple[list[str], int]:
@@ -634,6 +789,7 @@ class DeviceController:
         with self._operation_lock:
             self.monitor.stop_monitor()
             self._run_mpremote(
+                port,
                 [
                     "connect",
                     port,
@@ -645,7 +801,7 @@ class DeviceController:
                     " pass\n",
                 ]
             )
-            listing = self._run_mpremote(["connect", port, "fs", "ls"])
+            listing = self._run_mpremote(port, ["connect", port, "fs", "ls"])
             self._reset(port)
         return {
             "ok": True,
@@ -774,7 +930,8 @@ class MCPServer:
                 "get_bridge_status",
                 "Get bridge status",
                 "Report the selected device, monitor state, last serial error, "
-                "and whether mpremote is installed on the host.",
+                "whether mpremote is installed, and retained evidence from the "
+                "most recent device-control handoff.",
                 _object_schema(),
                 self.controller.status,
                 read_only=True,

@@ -13,11 +13,13 @@ sandbox. It opens the selected TTY itself, so it does not depend on localhost,
 - Reports whether each device is readable and writable by the MCP host.
 - Lets the agent select an exact device returned by discovery.
 - Copies MicroPython files to the MCU with `mpremote`.
+- Sends repeated direct serial interrupts before each `mpremote` handoff.
 - Resets the MCU and monitors serial output at 115200 baud.
 - Buffers serial logs and supports cursor-based incremental reads.
 - Installs an optional on-device runtime for structured state inspection,
   exported function calls, and focused expression or statement evaluation.
 - Keeps serial access in one MCP process and serializes runtime requests.
+- Retains takeover RX/TX evidence when raw REPL cannot be entered.
 - Has no network listener and no MCP shutdown tool.
 
 ## Requirements
@@ -100,7 +102,7 @@ workflow because macOS device suffixes can change after reconnecting USB.
 | --- | --- |
 | `list_serial_ports` | List supported connected devices and access status. |
 | `select_serial_port` | Select an exact discovered `/dev/cu.*` path. |
-| `get_bridge_status` | Show selection, monitor state, errors, and `mpremote`. |
+| `get_bridge_status` | Show selection, monitor state, `mpremote`, and the last device-control evidence. |
 | `install_files` | Copy absolute host paths and optionally install the runtime. |
 | `install_debug_runtime` | Install the bundled on-device helper. |
 | `remove_debug_runtime` | Remove the helper and reset the MCU. |
@@ -114,6 +116,13 @@ workflow because macOS device suffixes can change after reconnecting USB.
 Tools that install, remove, reset, or evaluate code are marked as
 side-effecting or destructive in their MCP annotations so Codex can apply its
 normal approval policy.
+
+Before each `mpremote` command, the MCP process releases its monitor and sends
+repeated Ctrl-C interrupts directly to the selected TTY. If `mpremote` still
+cannot enter raw REPL, the tool error and `get_bridge_status` retain the
+transmitted bytes, received bytes and text, prompt detection, command, and
+`mpremote` error. This distinguishes a responsive REPL from an application
+stuck in native code or hardware that requires an external reset.
 
 ## Typical Agent Workflow
 
