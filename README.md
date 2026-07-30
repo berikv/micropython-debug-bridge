@@ -45,6 +45,13 @@ By default, the server keeps running through incidental `SIGTERM` and `SIGHUP`
 signals and stops when you press Ctrl-C. This prevents bounded command runners
 from ending the bridge after an HTTP request times out.
 
+The HTTP server accepts requests on independent daemon threads with a backlog of
+64 connections. Runtime requests are serialized because they share one framed
+serial stream; `/health`, `/logs`, and `/debug/threads` remain available while a
+device call is active or waiting. `/health` reports active HTTP and runtime
+requests, monitor-thread state, and the last monitor error. `/debug/threads`
+also includes the 50 most recently completed HTTP requests.
+
 ## Skill
 
 Use the micropython-debug-bridge skill to communicate with the server.

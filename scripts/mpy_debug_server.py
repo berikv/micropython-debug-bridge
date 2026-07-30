@@ -94,22 +94,49 @@ class MonitorState:
     def __init__(self):
         self._lock = threading.Lock()
         self._response_condition = threading.Condition(self._lock)
+        self._runtime_request_lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._lines = deque(maxlen=LOG_CAPACITY)
         self._responses = []
         self._cursor = 0
         self._serial_fd = None
         self._monitor_thread = None
+        self._monitor_error = None
         self._stop_event = None
         self._port = None
         self._next_request_id = 1
+        self._active_runtime_request = None
         self._install_log_path = None
         self._install_log_sequence = 0
+        self._log_error = None
 
     def snapshot(self):
+        with self._log_lock:
+            log_error = self._log_error
         with self._lock:
+            monitor_thread = self._monitor_thread
+            active_runtime_request = self._active_runtime_request
+            if active_runtime_request is not None:
+                active_runtime_request = dict(active_runtime_request)
+                active_runtime_request["elapsed_sec"] = round(
+                    time.monotonic() - active_runtime_request.pop("started_monotonic"),
+                    3,
+                )
             return {
                 "port": self._port,
-                "monitoring": self._monitor_thread is not None and self._monitor_thread.is_alive(),
+                "monitoring": monitor_thread is not None and monitor_thread.is_alive(),
+                "monitor_thread": (
+                    {
+                        "name": monitor_thread.name,
+                        "ident": monitor_thread.ident,
+                        "alive": monitor_thread.is_alive(),
+                    }
+                    if monitor_thread is not None
+                    else None
+                ),
+                "monitor_error": self._monitor_error,
+                "active_runtime_request": active_runtime_request,
+                "log_error": log_error,
                 "cursor": self._cursor,
             }
 
@@ -123,11 +150,15 @@ class MonitorState:
         with self._lock:
             self._cursor += 1
             self._lines.append((self._cursor, line))
-            self._write_log_line_locked("SERIAL LINE: " + line)
+        self.append_log_event("SERIAL LINE: " + line)
 
     def append_log_event(self, message):
-        with self._lock:
-            self._write_log_line_locked(message)
+        with self._log_lock:
+            try:
+                self._write_log_line_locked(message)
+            except OSError as exc:
+                self._log_error = str(exc)
+                self._install_log_path = None
 
     def append_serial_bytes(self, direction, data):
         self.append_log_event("SERIAL {}: {}".format(direction, data.hex()))
@@ -140,7 +171,7 @@ class MonitorState:
             handle.write(gzip.compress(encoded))
 
     def start_monitor_log(self):
-        with self._lock:
+        with self._log_lock:
             self._close_install_log_locked()
             self._install_log_sequence += 1
             log_dir = os.path.join(REPO_DIR, LOG_DIR_NAME)
@@ -151,11 +182,12 @@ class MonitorState:
             print(f"Logging to {path}")
             open(path, "ab").close()
             self._install_log_path = path
+            self._log_error = None
             self._write_log_line_locked("MONITOR LOG START: {}".format(stamp))
             return path
 
     def close_install_log(self):
-        with self._lock:
+        with self._log_lock:
             self._close_install_log_locked()
 
     def _close_install_log_locked(self):
@@ -165,9 +197,9 @@ class MonitorState:
 
     def append_response(self, payload):
         with self._response_condition:
-            self._write_log_line_locked("RUNTIME RESPONSE: {}".format(json.dumps(payload)))
             self._responses.append(payload)
             self._response_condition.notify_all()
+        self.append_log_event("RUNTIME RESPONSE: {}".format(json.dumps(payload)))
 
     def get_lines(self, tail=None, since=None):
         with self._lock:
@@ -187,6 +219,7 @@ class MonitorState:
             self._stop_event = None
             self._serial_fd = None
             self._monitor_thread = None
+            self._monitor_error = None
             self._port = None
         if stop_event is not None:
             stop_event.set()
@@ -218,6 +251,7 @@ class MonitorState:
             self._serial_fd = serial_fd
             self._stop_event = stop_event
             self._monitor_thread = thread
+            self._monitor_error = None
             self._port = port
         thread.start()
 
@@ -236,6 +270,8 @@ class MonitorState:
                     raise RuntimeError("timed out writing to serial monitor")
                 time.sleep(0.01)
                 continue
+            except OSError as exc:
+                raise RuntimeError("failed writing to serial monitor: {}".format(exc)) from exc
             if written <= 0:
                 raise RuntimeError("failed to write to serial monitor")
             self.append_serial_bytes("TX", data[total_written: total_written + written])
@@ -247,6 +283,22 @@ class MonitorState:
             self._next_request_id += 1
             return request_id
 
+    def begin_runtime_request(self, request_id, mode, timeout_sec):
+        self._runtime_request_lock.acquire()
+        with self._lock:
+            self._active_runtime_request = {
+                "request_id": request_id,
+                "mode": mode,
+                "timeout_sec": timeout_sec,
+                "thread": threading.current_thread().name,
+                "started_monotonic": time.monotonic(),
+            }
+
+    def end_runtime_request(self):
+        with self._lock:
+            self._active_runtime_request = None
+        self._runtime_request_lock.release()
+
     def wait_for_response(self, request_id, timeout_sec):
         deadline = time.monotonic() + timeout_sec
         with self._response_condition:
@@ -255,11 +307,31 @@ class MonitorState:
                     if payload.get("request_id") == request_id:
                         return self._responses.pop(index)
                 if self._serial_fd is None:
+                    if self._monitor_error:
+                        raise RuntimeError("monitor stopped: {}".format(self._monitor_error))
                     raise RuntimeError("monitor is not running")
+                if self._monitor_thread is None or not self._monitor_thread.is_alive():
+                    message = self._monitor_error or "monitor thread stopped unexpectedly"
+                    raise RuntimeError("monitor stopped: {}".format(message))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("timed out waiting for device response")
                 self._response_condition.wait(timeout=remaining)
+
+    def _record_monitor_error(self, serial_fd, exc):
+        message = str(exc)
+        with self._response_condition:
+            if self._serial_fd == serial_fd:
+                self._serial_fd = None
+            self._monitor_error = message
+            self._cursor += 1
+            self._lines.append((self._cursor, "MONITOR ERROR: {}".format(message)))
+            self._response_condition.notify_all()
+        self.append_log_event("MONITOR ERROR: {}".format(message))
+        try:
+            os.close(serial_fd)
+        except OSError:
+            pass
 
     def _monitor_loop(self, serial_fd, stop_event):
         buffer = bytearray()
@@ -276,7 +348,7 @@ class MonitorState:
             except OSError as exc:
                 if stop_event.is_set():
                     return
-                self.append_line("MONITOR ERROR: {}".format(exc))
+                self._record_monitor_error(serial_fd, exc)
                 return
             if not chunk:
                 continue
@@ -389,20 +461,110 @@ def reset_board(port):
 
 
 class MPYDebugServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 64
+
     def __init__(self, server_address, handler_class, serial_port):
         super().__init__(server_address, handler_class)
         self.serial_port = serial_port
+        self._request_lock = threading.Lock()
+        self._active_requests = {}
+        self._recent_requests = deque(maxlen=50)
+        self._next_http_request_id = 1
+
+    def begin_request(self, method, path):
+        with self._request_lock:
+            request_id = self._next_http_request_id
+            self._next_http_request_id += 1
+            self._active_requests[request_id] = {
+                "request_id": request_id,
+                "method": method,
+                "path": path,
+                "thread": threading.current_thread().name,
+                "thread_ident": threading.get_ident(),
+                "operation": "handling request",
+                "started_monotonic": time.monotonic(),
+            }
+        STATE.append_log_event(
+            "HTTP REQUEST START: id={} method={} path={} thread={}".format(
+                request_id,
+                method,
+                path,
+                threading.current_thread().name,
+            )
+        )
+        return request_id
+
+    def update_request(self, request_id, operation):
+        with self._request_lock:
+            request = self._active_requests.get(request_id)
+            if request is not None:
+                request["operation"] = operation
+
+    def finish_request_tracking(self, request_id, status, error=None):
+        with self._request_lock:
+            request = self._active_requests.pop(request_id, None)
+        if request is None:
+            return
+        elapsed_sec = time.monotonic() - request["started_monotonic"]
+        completed = {
+            key: value
+            for key, value in request.items()
+            if key != "started_monotonic"
+        }
+        completed["status"] = status
+        completed["elapsed_sec"] = round(elapsed_sec, 3)
+        completed["error"] = error
+        with self._request_lock:
+            self._recent_requests.append(completed)
+        STATE.append_log_event(
+            "HTTP REQUEST END: id={} status={} elapsed={:.3f}s{}".format(
+                request_id,
+                status if status is not None else "connection-closed",
+                elapsed_sec,
+                " error={!r}".format(error) if error else "",
+            )
+        )
+
+    def request_snapshot(self, exclude_request_id=None):
+        with self._request_lock:
+            requests = []
+            now = time.monotonic()
+            for request_id, request in self._active_requests.items():
+                if request_id == exclude_request_id:
+                    continue
+                item = dict(request)
+                item["elapsed_sec"] = round(now - item.pop("started_monotonic"), 3)
+                requests.append(item)
+        return {
+            "active_http_request_count": len(requests),
+            "active_http_requests": requests,
+            "request_queue_size": self.request_queue_size,
+        }
+
+    def recent_request_snapshot(self):
+        with self._request_lock:
+            return list(self._recent_requests)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MPYDebugBridge/0.2"
+    server_version = "MPYDebugBridge/0.3"
 
     def do_GET(self):
+        self._run_tracked_request(self._do_GET)
+
+    def _do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             return self.send_json(
                 HTTPStatus.OK,
-                {"ok": True, **STATE.snapshot()},
+                {
+                    "ok": True,
+                    **STATE.snapshot(),
+                    **self.server.request_snapshot(self._bridge_request_id),
+                },
             )
         if parsed.path == "/logs":
             query = parse_qs(parsed.query)
@@ -416,14 +578,23 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/debug/threads":
             return self.send_json(
                 HTTPStatus.OK,
-                {"ok": True, "threads": collect_thread_stacks(), **STATE.snapshot()},
+                {
+                    "ok": True,
+                    "threads": collect_thread_stacks(),
+                    "recent_http_requests": self.server.recent_request_snapshot(),
+                    **STATE.snapshot(),
+                    **self.server.request_snapshot(self._bridge_request_id),
+                },
             )
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        self._run_tracked_request(self._do_POST)
+
+    def _do_POST(self):
         parsed = urlparse(self.path)
-        body = self.read_json()
         try:
+            body = self.read_json()
             if parsed.path == "/install":
                 return self.send_json(HTTPStatus.OK, self.handle_install(body, monitor=False))
             if parsed.path == "/monitor":
@@ -449,6 +620,31 @@ class Handler(BaseHTTPRequestHandler):
         except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
             return self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _run_tracked_request(self, callback):
+        self._response_status = None
+        self._bridge_request_id = self.server.begin_request(self.command, self.path)
+        error = None
+        try:
+            callback()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            error = "{}: {}".format(type(exc).__name__, exc)
+        except Exception as exc:
+            error = "{}: {}".format(type(exc).__name__, exc)
+            traceback.print_exc()
+            try:
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": "internal server error"},
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            self.server.finish_request_tracking(
+                self._bridge_request_id,
+                self._response_status,
+                error,
+            )
 
     def handle_install(self, body, monitor):
         port = self.server.serial_port
@@ -546,17 +742,38 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def send_runtime_request(self, request, timeout_sec):
-        snapshot = STATE.snapshot()
-        if not snapshot["monitoring"]:
-            raise RuntimeError("monitor is not running; call install-and-monitor first")
         request_id = STATE.next_request_id()
         payload = dict(request)
         payload["request_id"] = request_id
-        encoded = json.dumps(payload).encode("utf-8")
-        frame = FRAME_PREFIX_BYTES + str(len(encoded)).encode("utf-8") + b"\n" + encoded + b"\n"
-        STATE.append_log_event("RUNTIME REQUEST: {}".format(json.dumps(payload)))
-        STATE.write_bytes(frame)
-        return STATE.wait_for_response(request_id, timeout_sec)
+        self.server.update_request(
+            self._bridge_request_id,
+            "waiting for serial runtime request lock",
+        )
+        STATE.begin_runtime_request(request_id, payload.get("mode"), timeout_sec)
+        try:
+            snapshot = STATE.snapshot()
+            if not snapshot["monitoring"]:
+                message = "monitor is not running; call install-and-monitor first"
+                if snapshot["monitor_error"]:
+                    message = "monitor stopped: {}".format(snapshot["monitor_error"])
+                raise RuntimeError(message)
+            self.server.update_request(
+                self._bridge_request_id,
+                "waiting for device response {}".format(request_id),
+            )
+            encoded = json.dumps(payload).encode("utf-8")
+            frame = (
+                FRAME_PREFIX_BYTES
+                + str(len(encoded)).encode("utf-8")
+                + b"\n"
+                + encoded
+                + b"\n"
+            )
+            STATE.append_log_event("RUNTIME REQUEST: {}".format(json.dumps(payload)))
+            STATE.write_bytes(frame)
+            return STATE.wait_for_response(request_id, timeout_sec)
+        finally:
+            STATE.end_runtime_request()
 
     def handle_runtime(self, body):
         timeout_sec = parse_int(body.get("timeout_sec")) or DEVICE_COMMAND_TIMEOUT_SEC
@@ -617,12 +834,17 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def send_json(self, status, payload):
+        self._response_status = int(status)
         body = json.dumps(payload).encode("utf-8") + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_error(self, code, message=None, explain=None):
+        self._response_status = int(code)
+        return super().send_error(code, message, explain)
 
     def log_message(self, fmt, *args):
         message = fmt % args

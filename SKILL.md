@@ -24,6 +24,11 @@ The server is persistent by default: Ctrl-C stops it, while incidental `SIGTERM`
 and `SIGHUP` signals are ignored. Add `--stop-on-sigterm` only when launching it
 under a process supervisor that deliberately uses `SIGTERM` for shutdown.
 
+Runtime calls share one serial stream and are serialized by the server. Health
+and debugging endpoints remain responsive during a long runtime call. Inspect
+`health` for active request, runtime request, monitor-thread, and monitor-error
+details; use `debug-threads` for thread stacks and recently completed requests.
+
 ## Runtime Model
 
 The shared MCU runtime is bundled at `scripts/codex_debug_runtime.py` and is installed onto the MCU only when requested, for example with `install-and-monitor --runtime`.
