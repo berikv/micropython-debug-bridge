@@ -1,14 +1,36 @@
-# Micro Python Debug Bridge
+# MicroPython Debug Bridge
 
 Generic host-side bridge for MicroPython projects. A human starts the server with access to a specific serial port; agents and scripts then use the HTTP/CLI bridge to install files, reset the MCU, monitor serial output, and call the optional on-device debug runtime.
+
+## Install
+
+Clone the repository into your personal Codex skills directory:
+
+```bash
+mkdir -p "$HOME/.codex/skills"
+git clone https://github.com/berikv/micropython-debug-bridge.git \
+  "$HOME/.codex/skills/micropython-debug-bridge"
+```
+
+Confirm that the bridge CLI is available:
+
+```bash
+"$HOME/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh" help
+```
+
+To update an existing installation:
+
+```bash
+git -C "$HOME/.codex/skills/micropython-debug-bridge" pull
+```
 
 ## Start
 
 Start the server with the connected serial port:
 
 ```bash
-MPY_DEBUG_BRIDGE="/path/to/debug_bridge"
-"$MPY_DEBUG_BRIDGE"/mpy_bridge.sh serve --serial-port "/dev/cu.usbmodem1101"
+"$HOME/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh" \
+  serve --serial-port "/dev/cu.usbmodem1101"
 ```
 
 The server accepts:
