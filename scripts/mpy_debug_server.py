@@ -2,7 +2,6 @@
 
 import argparse
 import gzip
-import glob
 import json
 import os
 import select
@@ -30,6 +29,7 @@ SERIAL_WRITE_TIMEOUT_SEC = 5
 FRAME_PREFIX = "@@FRAME@@ "
 FRAME_PREFIX_BYTES = FRAME_PREFIX.encode("utf-8")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(SCRIPT_DIR)
 DEBUG_RUNTIME_PATH = os.path.join(SCRIPT_DIR, "codex_debug_runtime.py")
 DEBUG_RUNTIME_NAME = os.path.basename(DEBUG_RUNTIME_PATH)
 
@@ -39,10 +39,10 @@ class CommandRunner:
         self._lock = threading.Lock()
         self._processes = set()
 
-    def run(self, argv, cwd):
+    def run(self, argv):
         process = subprocess.Popen(
             argv,
-            cwd=cwd,
+            cwd=REPO_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -139,18 +139,19 @@ class MonitorState:
         with open(self._install_log_path, "ab") as handle:
             handle.write(gzip.compress(encoded))
 
-    def start_install_log(self, repo_root):
+    def start_monitor_log(self):
         with self._lock:
             self._close_install_log_locked()
             self._install_log_sequence += 1
-            log_dir = os.path.join(repo_root, LOG_DIR_NAME)
+            log_dir = os.path.join(REPO_DIR, LOG_DIR_NAME)
             os.makedirs(log_dir, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            filename = "install-{}-{:04d}.log.gz".format(stamp, self._install_log_sequence)
+            filename = "monitor-{}-{:04d}.log.gz".format(stamp, self._install_log_sequence)
             path = os.path.join(log_dir, filename)
+            print(f"Logging to {path}")
             open(path, "ab").close()
             self._install_log_path = path
-            self._write_log_line_locked("INSTALL LOG START: {}".format(stamp))
+            self._write_log_line_locked("MONITOR LOG START: {}".format(stamp))
             return path
 
     def close_install_log(self):
@@ -159,7 +160,7 @@ class MonitorState:
 
     def _close_install_log_locked(self):
         if self._install_log_path is not None:
-            self._write_log_line_locked("INSTALL LOG END")
+            self._write_log_line_locked("MONITOR LOG END")
             self._install_log_path = None
 
     def append_response(self, payload):
@@ -201,9 +202,11 @@ class MonitorState:
         with self._response_condition:
             self._response_condition.notify_all()
 
-    def start_monitor(self, port, repo_root, close_log=True):
-        self.stop_monitor(close_log=close_log)
-        configure_serial_port(port, repo_root)
+    def start_monitor(self, port, new_log=True):
+        self.stop_monitor(close_log=new_log)
+        if new_log:
+            self.start_monitor_log()
+        configure_serial_port(port)
         serial_fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -317,16 +320,16 @@ class MonitorState:
 STATE = MonitorState()
 
 
-def configure_serial_port(port, repo_root):
-    run_command(["stty", "-f", port, str(SERIAL_BAUD), "raw", "-echo"], cwd=repo_root)
+def configure_serial_port(port):
+    run_command(["stty", "-f", port, str(SERIAL_BAUD), "raw", "-echo"])
 
 
-def run_command(argv, cwd):
+def run_command(argv):
     should_log = bool(argv) and argv[0] == "mpremote"
     if should_log:
         STATE.append_log_event("MPREMOTE RUN: {}".format(json.dumps(argv)))
     try:
-        stdout = RUNNER.run(argv, cwd)
+        stdout = RUNNER.run(argv)
     except Exception as exc:
         if should_log:
             STATE.append_log_event("MPREMOTE ERROR: {}".format(str(exc)))
@@ -338,31 +341,30 @@ def run_command(argv, cwd):
     return stdout
 
 
-def micropython_files(repo_root):
-    files = sorted(glob.glob(os.path.join(repo_root, "*.py")))
-    if not files:
-        raise ValueError("no Python files found in {}".format(repo_root))
-    return files
-
-
-def install_files(repo_root, port, reset=True):
-    files = micropython_files(repo_root)
-    run_command(["mpremote", "connect", port, "fs", "cp", *files, ":"], cwd=repo_root)
-    listing = run_command(["mpremote", "connect", port, "fs", "ls"], cwd=repo_root)
+def install_files(files, port, reset=True):
+    if not isinstance(files, list) or not files:
+        raise ValueError("install requires a non-empty files list")
+    for path in files:
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError("install file paths must be absolute: {}".format(path))
+        if not os.path.isfile(path):
+            raise ValueError("install file does not exist: {}".format(path))
+    run_command(["mpremote", "connect", port, "fs", "cp", *files, ":"])
+    listing = run_command(["mpremote", "connect", port, "fs", "ls"])
     if reset:
-        reset_board(port, repo_root)
+        reset_board(port)
     return {"files": [os.path.basename(path) for path in files], "listing": listing}
 
 
-def install_debug_runtime(port, repo_root, reset=True):
-    run_command(["mpremote", "connect", port, "fs", "cp", DEBUG_RUNTIME_PATH, ":"], cwd=repo_root)
-    listing = run_command(["mpremote", "connect", port, "fs", "ls"], cwd=repo_root)
+def install_debug_runtime(port, reset=True):
+    run_command(["mpremote", "connect", port, "fs", "cp", DEBUG_RUNTIME_PATH, ":"])
+    listing = run_command(["mpremote", "connect", port, "fs", "ls"])
     if reset:
-        reset_board(port, repo_root)
+        reset_board(port)
     return {"files": [DEBUG_RUNTIME_NAME], "listing": listing}
 
 
-def remove_debug_runtime(port, repo_root, reset=True):
+def remove_debug_runtime(port, reset=True):
     run_command(
         [
             "mpremote",
@@ -375,23 +377,21 @@ def remove_debug_runtime(port, repo_root, reset=True):
             "except OSError:\n"
             " pass\n".format(DEBUG_RUNTIME_NAME),
         ],
-        cwd=repo_root,
     )
-    listing = run_command(["mpremote", "connect", port, "fs", "ls"], cwd=repo_root)
+    listing = run_command(["mpremote", "connect", port, "fs", "ls"])
     if reset:
-        reset_board(port, repo_root)
+        reset_board(port)
     return {"files": [DEBUG_RUNTIME_NAME], "listing": listing}
 
 
-def reset_board(port, repo_root):
-    run_command(["mpremote", "connect", port, "reset"], cwd=repo_root)
+def reset_board(port):
+    run_command(["mpremote", "connect", port, "reset"])
 
 
 class MPYDebugServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_class, serial_port, repo_root):
+    def __init__(self, server_address, handler_class, serial_port):
         super().__init__(server_address, handler_class)
         self.serial_port = serial_port
-        self.repo_root = repo_root
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -402,7 +402,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             return self.send_json(
                 HTTPStatus.OK,
-                {"ok": True, "repo_root": self.server.repo_root, **STATE.snapshot()},
+                {"ok": True, **STATE.snapshot()},
             )
         if parsed.path == "/logs":
             query = parse_qs(parsed.query)
@@ -451,17 +451,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def handle_install(self, body, monitor):
-        repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
-        STATE.start_install_log(repo_root)
         if monitor:
             STATE.clear_logs()
+            STATE.start_monitor_log()
         include_runtime = bool(body.get("debug_runtime"))
+        files = body.get("files")
         try:
-            result = install_files(repo_root, port, reset=(not monitor) and (not include_runtime))
+            result = install_files(files, port, reset=(not monitor) and (not include_runtime))
             if include_runtime:
-                runtime_result = install_debug_runtime(port, repo_root, reset=not monitor)
+                runtime_result = install_debug_runtime(port, reset=not monitor)
                 result["files"].extend(runtime_result["files"])
                 result["listing"] = runtime_result["listing"]
         except Exception:
@@ -470,9 +470,8 @@ class Handler(BaseHTTPRequestHandler):
         if not monitor:
             result["monitoring"] = False
             result["port"] = port
-            STATE.close_install_log()
             return {"ok": True, **result}
-        STATE.start_monitor(port, repo_root, close_log=False)
+        STATE.start_monitor(port, new_log=False)
         time.sleep(0.2)
         STATE.write_bytes(b"\x03\x02\x04")
         time.sleep(0.5)
@@ -488,23 +487,21 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def handle_install_runtime(self, body, monitor):
-        repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
-        STATE.start_install_log(repo_root)
         if monitor:
             STATE.clear_logs()
+            STATE.start_monitor_log()
         try:
-            result = install_debug_runtime(port, repo_root, reset=not monitor)
+            result = install_debug_runtime(port, reset=not monitor)
         except Exception:
             STATE.close_install_log()
             raise
         if not monitor:
             result["monitoring"] = False
             result["port"] = port
-            STATE.close_install_log()
             return {"ok": True, **result}
-        STATE.start_monitor(port, repo_root, close_log=False)
+        STATE.start_monitor(port, new_log=False)
         time.sleep(0.2)
         STATE.write_bytes(b"\x03\x02\x04")
         time.sleep(0.5)
@@ -521,25 +518,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_remove_runtime(self, body):
         _ = body
-        repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
-        result = remove_debug_runtime(port, repo_root, reset=True)
+        result = remove_debug_runtime(port, reset=True)
         result["monitoring"] = False
         result["port"] = port
         return {"ok": True, **result}
 
     def handle_reset(self):
-        repo_root = self.server.repo_root
         port = self.server.serial_port
         STATE.stop_monitor()
-        reset_board(port, repo_root)
+        reset_board(port)
         return {"ok": True, "port": port}
 
     def handle_monitor(self):
         port = self.server.serial_port
         STATE.clear_logs()
-        STATE.start_monitor(port, self.server.repo_root)
+        STATE.start_monitor(port)
         time.sleep(0.2)
         lines, cursor = STATE.get_lines(tail=50)
         return {
@@ -668,6 +663,11 @@ def parse_args():
     parser.add_argument("--host", default=DEFAULT_HTTP_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     parser.add_argument("--serial-port", type=str, default=None)
+    parser.add_argument(
+        "--stop-on-sigterm",
+        action="store_true",
+        help="allow a process supervisor to stop the server with SIGTERM",
+    )
     return parser.parse_args()
 
 
@@ -677,25 +677,38 @@ def main():
     if serial_port is None:
         print("Usage: python3 mpy_debug_server.py --serial-port /dev/cu.usbmodem...")
         return
-    repo_root = os.path.abspath(os.getenv("MPY_PROJECT_ROOT") or os.getcwd())
-    if not os.path.isdir(repo_root):
-        print("repo root does not exist: {}".format(repo_root))
-        return
-
-    server = MPYDebugServer((args.host, args.port), Handler, serial_port, repo_root)
+    server = MPYDebugServer((args.host, args.port), Handler, serial_port)
     stop_requested = {"value": False}
 
-    def handle_signal(signum, frame):
+    def stop_server(signum, frame):
         _ = frame
         if stop_requested["value"]:
             return
         stop_requested["value"] = True
+        print(
+            "Stopping server after {}".format(signal.Signals(signum).name),
+            flush=True,
+        )
         RUNNER.kill_active()
         STATE.stop_monitor()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    def ignore_termination_signal(signum, frame):
+        _ = frame
+        print(
+            "Ignoring {}; press Ctrl-C to stop the server".format(
+                signal.Signals(signum).name
+            ),
+            flush=True,
+        )
+
+    signal.signal(signal.SIGINT, stop_server)
+    if args.stop_on_sigterm:
+        signal.signal(signal.SIGTERM, stop_server)
+    else:
+        signal.signal(signal.SIGTERM, ignore_termination_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, ignore_termination_signal)
     try:
         server.serve_forever()
     finally:

@@ -4,11 +4,11 @@ Generic host-side bridge for MicroPython projects. A human starts the server wit
 
 ## Start
 
-From an app repository:
+Start the server with the connected serial port:
 
 ```bash
-python3 mpy_debug_server.py --serial-port "/dev/cu.usbmodem1101"
 MPY_DEBUG_BRIDGE="/path/to/debug_bridge"
+"$MPY_DEBUG_BRIDGE"/mpy_bridge.sh serve --serial-port "/dev/cu.usbmodem1101"
 ```
 
 The server accepts:
@@ -16,10 +16,33 @@ The server accepts:
 - `--serial-port`
 - `--host`, defaulting to `127.0.0.1`
 - `--port`, defaulting to `8765`
+- `--stop-on-sigterm`, for process supervisors that intentionally stop services
+  with `SIGTERM`
+
+By default, the server keeps running through incidental `SIGTERM` and `SIGHUP`
+signals and stops when you press Ctrl-C. This prevents bounded command runners
+from ending the bridge after an HTTP request times out.
 
 ## Skill
 
 Use the micropython-debug-bridge skill to communicate with the server.
+
+## Install Files
+
+The server does not discover project files. Clients must choose the files to install and send absolute paths:
+
+```json
+{"files":["/absolute/path/main.py","/absolute/path/lib.py"]}
+```
+
+The bundled CLI accepts absolute paths:
+
+```bash
+"$MPY_DEBUG_BRIDGE"/mpy_bridge.sh install /absolute/path/main.py /absolute/path/lib.py
+"$MPY_DEBUG_BRIDGE"/mpy_bridge.sh install-and-monitor --runtime /absolute/path/main.py
+```
+
+If no paths are passed to the CLI install commands, the CLI expands `*.py` in its current directory and sends those absolute paths.
 
 ## Runtime
 

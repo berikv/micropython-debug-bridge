@@ -14,10 +14,10 @@ Usage:
   mpy_bridge.sh logs [tail]
   mpy_bridge.sh logs --tail [n]
   mpy_bridge.sh debug-threads
-  mpy_bridge.sh install [--runtime]
+  mpy_bridge.sh install [--runtime] [absolute_file ...]
   mpy_bridge.sh monitor
   mpy_bridge.sh reset
-  mpy_bridge.sh install-and-monitor [--runtime]
+  mpy_bridge.sh install-and-monitor [--runtime] [absolute_file ...]
   mpy_bridge.sh install-runtime
   mpy_bridge.sh install-runtime-and-monitor
   mpy_bridge.sh remove-runtime
@@ -39,6 +39,33 @@ json_post() {
 
 python_json() {
   python3 - "$@"
+}
+
+install_body() {
+  local include_runtime="$1"
+  shift
+  python_json "$include_runtime" "$@" <<'PY'
+import glob
+import json
+import os
+import sys
+
+include_runtime = sys.argv[1] == "true"
+files = sys.argv[2:]
+if not files:
+    files = sorted(os.path.abspath(path) for path in glob.glob("*.py"))
+if not files:
+    raise SystemExit("no Python files specified and none found in current directory")
+for path in files:
+    if not os.path.isabs(path):
+        raise SystemExit("install file path must be absolute: {}".format(path))
+    if not os.path.isfile(path):
+        raise SystemExit("install file does not exist: {}".format(path))
+payload = {"files": files}
+if include_runtime:
+    payload["debug_runtime"] = True
+print(json.dumps(payload))
+PY
 }
 
 action="${1:-}"
@@ -98,10 +125,13 @@ PY
     ;;
   install)
     if [[ "${2:-}" == "--runtime" ]]; then
-      json_post "/install" '{"debug_runtime":true}'
+      shift 2
+      body="$(install_body true "$@")"
     else
-      json_post "/install" "{}"
+      shift
+      body="$(install_body false "$@")"
     fi
+    json_post "/install" "${body}"
     ;;
   monitor)
     json_post "/monitor" "{}"
@@ -111,10 +141,13 @@ PY
     ;;
   install-and-monitor)
     if [[ "${2:-}" == "--runtime" ]]; then
-      json_post "/install-and-monitor" '{"debug_runtime":true}'
+      shift 2
+      body="$(install_body true "$@")"
     else
-      json_post "/install-and-monitor" "{}"
+      shift
+      body="$(install_body false "$@")"
     fi
+    json_post "/install-and-monitor" "${body}"
     ;;
   install-runtime)
     json_post "/install-runtime" "{}"
