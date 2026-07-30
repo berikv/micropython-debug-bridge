@@ -1,8 +1,13 @@
 import importlib.util
+import io
+import json
 import os
+import socket
 import threading
 import time
 import unittest
+import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 
@@ -90,6 +95,100 @@ class HTTPServerConfigurationTests(unittest.TestCase):
         self.assertTrue(SERVER.MPYDebugServer.daemon_threads)
         self.assertFalse(SERVER.MPYDebugServer.block_on_close)
         self.assertEqual(SERVER.MPYDebugServer.request_queue_size, 64)
+
+
+class ListenerLoopTests(unittest.TestCase):
+    def test_repeated_listener_exceptions_are_logged_and_stop_the_loop(self):
+        class FailingServer:
+            shutdown_reason = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def serve_forever(self):
+                self.calls += 1
+                raise OSError("listener failed")
+
+            def diagnostic_snapshot(self):
+                return {"active_http_requests": [{"request_id": 7}]}
+
+            def fileno(self):
+                return 10
+
+        server = FailingServer()
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            SERVER.serve_listener(server)
+
+        self.assertEqual(server.calls, 3)
+        self.assertEqual(
+            server.shutdown_reason,
+            "listener loop failed 3 consecutive times",
+        )
+        self.assertEqual(output.getvalue().count("LISTENER LOOP EXCEPTION:"), 3)
+        self.assertIn('"request_id": 7', output.getvalue())
+
+
+class LongRequestRegressionTests(unittest.TestCase):
+    def test_long_call_and_disconnected_client_leave_listener_available(self):
+        class SlowHandler(SERVER.Handler):
+            def handle_state(self, body):
+                _ = body
+                time.sleep(0.25)
+                return {"ok": True, "state": "complete"}
+
+            def handle_install(self, body, monitor):
+                _ = body
+                return {"ok": True, "monitoring": monitor}
+
+            def log_message(self, fmt, *args):
+                _ = (fmt, args)
+
+        server = SERVER.MPYDebugServer(
+            ("127.0.0.1", 0),
+            SlowHandler,
+            "/dev/test",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+
+        def fetch(path, body=None):
+            url = "http://{}:{}{}".format(host, port, path)
+            if body is None:
+                request = url
+            else:
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    method="POST",
+                )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, json.loads(response.read())
+
+        try:
+            self.assertEqual(fetch("/state", {})[0], 200)
+            self.assertEqual(fetch("/health")[0], 200)
+            self.assertEqual(fetch("/install-and-monitor", {})[0], 200)
+
+            client = socket.create_connection((host, port), timeout=2)
+            client.sendall(
+                b"POST /state HTTP/1.1\r\n"
+                + b"Host: 127.0.0.1\r\n"
+                + b"Content-Type: application/json\r\n"
+                + b"Content-Length: 2\r\n"
+                + b"\r\n{}"
+            )
+            client.close()
+            time.sleep(0.35)
+
+            status, health = fetch("/health")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["active_http_request_count"], 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

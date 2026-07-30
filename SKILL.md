@@ -20,9 +20,19 @@ Start the server with the connected serial port. The server does not infer proje
 
 Use the `/dev/cu.*` serial device on macOS when available.
 
-The server is persistent by default: Ctrl-C stops it, while incidental `SIGTERM`
-and `SIGHUP` signals are ignored. Add `--stop-on-sigterm` only when launching it
-under a process supervisor that deliberately uses `SIGTERM` for shutdown.
+Non-interactive starts automatically detach so the bridge survives the command
+runner's time limit. Use `--daemon` to request that explicitly, or
+`--foreground` when a supervisor must own the attached process. Stop a detached
+server with:
+
+```bash
+"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh stop
+```
+
+Listener-loop errors and final diagnostic snapshots are stored in
+`mpy-bridge-logs/server-8765.log`; detached server output is written there as
+well. Incidental `SIGTERM` and `SIGHUP` remain ignored unless
+`--stop-on-sigterm` is supplied.
 
 Runtime calls share one serial stream and are serialized by the server. Health
 and debugging endpoints remain responsive during a long runtime call. Inspect

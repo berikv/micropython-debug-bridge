@@ -43,17 +43,33 @@ Start the server with the connected serial port:
   serve --serial-port "/dev/cu.usbmodem1101"
 ```
 
+When started from a non-interactive command runner, the server automatically
+detaches into a new process session so the runner cannot kill it when a command
+time budget expires. Interactive terminal starts stay in the foreground and
+stop with Ctrl-C. Use `--daemon` or `--foreground` to select the mode explicitly.
+Stop a detached server through the local HTTP endpoint:
+
+```bash
+"$HOME/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh" stop
+```
+
+Server listener-loop exceptions and the final listener/health snapshot are
+written to `mpy-bridge-logs/server-8765.log`; detached server output is written
+there as well. The detached process ID is stored in
+`mpy-bridge-logs/server-8765.pid` while it is running.
+
 The server accepts:
 
 - `--serial-port`
 - `--host`, defaulting to `127.0.0.1`
 - `--port`, defaulting to `8765`
+- `--daemon`, to detach explicitly
+- `--foreground`, to stay attached explicitly
 - `--stop-on-sigterm`, for process supervisors that intentionally stop services
   with `SIGTERM`
 
-By default, the server keeps running through incidental `SIGTERM` and `SIGHUP`
-signals and stops when you press Ctrl-C. This prevents bounded command runners
-from ending the bridge after an HTTP request times out.
+The server ignores incidental `SIGTERM` and `SIGHUP` by default. Foreground
+servers stop with Ctrl-C; detached servers stop with `mpy_bridge.sh stop`.
 
 The HTTP server accepts requests on independent daemon threads with a backlog of
 64 connections. Runtime requests are serialized because they share one framed

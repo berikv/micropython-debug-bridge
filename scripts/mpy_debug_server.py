@@ -23,6 +23,7 @@ DEFAULT_HTTP_PORT = 8765
 SERIAL_BAUD = 115200
 LOG_CAPACITY = 2000
 LOG_DIR_NAME = "mpy-bridge-logs"
+DAEMON_START_TIMEOUT_SEC = 10
 COMMAND_TIMEOUT_SEC = 20
 DEVICE_COMMAND_TIMEOUT_SEC = 60
 SERIAL_WRITE_TIMEOUT_SEC = 5
@@ -466,10 +467,23 @@ class MPYDebugServer(ThreadingHTTPServer):
     block_on_close = False
     request_queue_size = 64
 
-    def __init__(self, server_address, handler_class, serial_port):
+    def __init__(
+        self,
+        server_address,
+        handler_class,
+        serial_port,
+        daemon_mode=False,
+        pid_path=None,
+        server_log_path=None,
+    ):
         super().__init__(server_address, handler_class)
         self.serial_port = serial_port
+        self.daemon_mode = daemon_mode
+        self.pid_path = pid_path
+        self.server_log_path = server_log_path
+        self.shutdown_reason = None
         self._request_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
         self._active_requests = {}
         self._recent_requests = deque(maxlen=50)
         self._next_http_request_id = 1
@@ -539,6 +553,11 @@ class MPYDebugServer(ThreadingHTTPServer):
                 item["elapsed_sec"] = round(now - item.pop("started_monotonic"), 3)
                 requests.append(item)
         return {
+            "pid": os.getpid(),
+            "daemon_mode": self.daemon_mode,
+            "listener_address": "{}:{}".format(*self.server_address),
+            "listener_fd": self.fileno(),
+            "shutdown_reason": self.shutdown_reason,
             "active_http_request_count": len(requests),
             "active_http_requests": requests,
             "request_queue_size": self.request_queue_size,
@@ -548,9 +567,29 @@ class MPYDebugServer(ThreadingHTTPServer):
         with self._request_lock:
             return list(self._recent_requests)
 
+    def diagnostic_snapshot(self):
+        return {
+            "pid": os.getpid(),
+            "daemon_mode": self.daemon_mode,
+            "listener_address": "{}:{}".format(*self.server_address),
+            "listener_fd": self.fileno(),
+            "shutdown_reason": self.shutdown_reason,
+            **STATE.snapshot(),
+            **self.request_snapshot(),
+            "recent_http_requests": self.recent_request_snapshot(),
+        }
+
+    def request_shutdown(self, reason):
+        with self._shutdown_lock:
+            if self.shutdown_reason is not None:
+                return
+            self.shutdown_reason = reason
+        print("Shutdown requested: {}".format(reason), flush=True)
+        threading.Thread(target=self.shutdown, daemon=True).start()
+
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MPYDebugBridge/0.3"
+    server_version = "MPYDebugBridge/0.4"
 
     def do_GET(self):
         self._run_tracked_request(self._do_GET)
@@ -617,6 +656,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(HTTPStatus.OK, self.handle_eval(body))
             if parsed.path == "/state":
                 return self.send_json(HTTPStatus.OK, self.handle_state(body))
+            if parsed.path == "/shutdown":
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "message": "server shutdown requested"},
+                )
+                self.server.request_shutdown("HTTP /shutdown")
+                return
         except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
             return self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -885,6 +931,17 @@ def parse_args():
     parser.add_argument("--host", default=DEFAULT_HTTP_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     parser.add_argument("--serial-port", type=str, default=None)
+    process_mode = parser.add_mutually_exclusive_group()
+    process_mode.add_argument(
+        "--daemon",
+        action="store_true",
+        help="detach and keep running after the starting command exits",
+    )
+    process_mode.add_argument(
+        "--foreground",
+        action="store_true",
+        help="stay attached even when standard input is not a terminal",
+    )
     parser.add_argument(
         "--stop-on-sigterm",
         action="store_true",
@@ -893,13 +950,161 @@ def parse_args():
     return parser.parse_args()
 
 
+def daemon_paths(http_port):
+    log_dir = os.path.join(REPO_DIR, LOG_DIR_NAME)
+    return (
+        os.path.join(log_dir, "server-{}.log".format(http_port)),
+        os.path.join(log_dir, "server-{}.pid".format(http_port)),
+    )
+
+
+def detach_process(log_path):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid:
+        os.close(write_fd)
+        ready, _, _ = select.select([read_fd], [], [], DAEMON_START_TIMEOUT_SEC)
+        if not ready:
+            os.close(read_fd)
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            raise RuntimeError("timed out waiting for detached server to start")
+        message = os.read(read_fd, 4096).decode("utf-8", "replace").strip()
+        os.close(read_fd)
+        if not message.startswith("READY "):
+            raise RuntimeError(message or "detached server exited during startup")
+        print(message, flush=True)
+        return True, None
+
+    os.close(read_fd)
+    os.setsid()
+    null_fd = os.open(os.devnull, os.O_RDONLY)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.dup2(null_fd, sys.stdin.fileno())
+    os.dup2(log_fd, sys.stdout.fileno())
+    os.dup2(log_fd, sys.stderr.fileno())
+    os.close(null_fd)
+    os.close(log_fd)
+    return False, write_fd
+
+
+def notify_daemon_parent(ready_fd, message):
+    if ready_fd is None:
+        return
+    try:
+        os.write(ready_fd, message.encode("utf-8", "replace"))
+    finally:
+        os.close(ready_fd)
+
+
+def write_pid_file(path):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{}\n".format(os.getpid()))
+
+
+def remove_own_pid_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            recorded_pid = int(handle.read().strip())
+        if recorded_pid == os.getpid():
+            os.unlink(path)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+
+def emit_server_event(server, message):
+    print(message, flush=True)
+    server_log_path = getattr(server, "server_log_path", None)
+    if getattr(server, "daemon_mode", False) or not server_log_path:
+        return
+    os.makedirs(os.path.dirname(server_log_path), exist_ok=True)
+    with open(server_log_path, "a", encoding="utf-8") as handle:
+        handle.write(message)
+        handle.write("\n")
+
+
+def serve_listener(server):
+    listener_failures = 0
+    while server.shutdown_reason is None:
+        try:
+            server.serve_forever()
+        except Exception as exc:
+            listener_failures += 1
+            emit_server_event(
+                server,
+                "LISTENER LOOP EXCEPTION: {}: {}".format(
+                    type(exc).__name__,
+                    exc,
+                ),
+            )
+            emit_server_event(server, traceback.format_exc().rstrip())
+            emit_server_event(
+                server,
+                "LISTENER SNAPSHOT: {}".format(
+                    json.dumps(server.diagnostic_snapshot(), default=str)
+                ),
+            )
+            if server.fileno() < 0 or listener_failures >= 3:
+                server.shutdown_reason = (
+                    "listener loop failed {} consecutive times".format(
+                        listener_failures
+                    )
+                )
+                break
+            time.sleep(0.1)
+            continue
+        if server.shutdown_reason is None:
+            listener_failures += 1
+            emit_server_event(
+                server,
+                "LISTENER LOOP RETURNED UNEXPECTEDLY: {}".format(
+                    json.dumps(server.diagnostic_snapshot(), default=str)
+                ),
+            )
+            if listener_failures >= 3:
+                server.shutdown_reason = (
+                    "listener loop returned unexpectedly {} consecutive times".format(
+                        listener_failures
+                    )
+                )
+                break
+            time.sleep(0.1)
+
+
 def main():
     args = parse_args()
     serial_port = args.serial_port or os.getenv("SERIAL_PORT")
     if serial_port is None:
         print("Usage: python3 mpy_debug_server.py --serial-port /dev/cu.usbmodem...")
-        return
-    server = MPYDebugServer((args.host, args.port), Handler, serial_port)
+        return 2
+
+    daemon_mode = args.daemon or (not args.foreground and not sys.stdin.isatty())
+    server_log_path, pid_path = daemon_paths(args.port)
+    daemon_parent = False
+    ready_fd = None
+    if daemon_mode:
+        daemon_parent, ready_fd = detach_process(server_log_path)
+        if daemon_parent:
+            return 0
+
+    try:
+        server = MPYDebugServer(
+            (args.host, args.port),
+            Handler,
+            serial_port,
+            daemon_mode=daemon_mode,
+            pid_path=pid_path if daemon_mode else None,
+            server_log_path=server_log_path,
+        )
+        if daemon_mode:
+            write_pid_file(pid_path)
+    except Exception as exc:
+        notify_daemon_parent(ready_fd, "ERROR: {}".format(exc))
+        raise
+
     stop_requested = {"value": False}
 
     def stop_server(signum, frame):
@@ -912,8 +1117,7 @@ def main():
             flush=True,
         )
         RUNNER.kill_active()
-        STATE.stop_monitor()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        server.request_shutdown(signal.Signals(signum).name)
 
     def ignore_termination_signal(signum, frame):
         _ = frame
@@ -931,12 +1135,30 @@ def main():
         signal.signal(signal.SIGTERM, ignore_termination_signal)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, ignore_termination_signal)
+    notify_daemon_parent(
+        ready_fd,
+        "READY pid={} url=http://{}:{} log={}".format(
+            os.getpid(),
+            args.host,
+            args.port,
+            server_log_path,
+        ),
+    )
     try:
-        server.serve_forever()
+        serve_listener(server)
     finally:
+        emit_server_event(
+            server,
+            "LISTENER FINAL SNAPSHOT: {}".format(
+                json.dumps(server.diagnostic_snapshot(), default=str)
+            ),
+        )
         STATE.stop_monitor()
         server.server_close()
+        if daemon_mode:
+            remove_own_pid_file(pid_path)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

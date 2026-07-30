@@ -9,7 +9,8 @@ usage() {
   cat <<'EOF'
 Usage:
   mpy_bridge.sh help
-  mpy_bridge.sh serve --serial-port
+  mpy_bridge.sh serve --serial-port [--daemon|--foreground]
+  mpy_bridge.sh stop
   mpy_bridge.sh health
   mpy_bridge.sh logs [tail]
   mpy_bridge.sh logs --tail [n]
@@ -76,6 +77,9 @@ case "$action" in
     ;;
   serve)
     exec python3 "$SCRIPT_DIR"/mpy_debug_server.py "${@:2}"
+    ;;
+  stop)
+    json_post "/shutdown" "{}"
     ;;
   health)
     exec curl -sS "${BASE_URL}/health"
