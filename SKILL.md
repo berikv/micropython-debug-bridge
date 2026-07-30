@@ -1,33 +1,46 @@
+---
+name: micropython-debug-bridge
+description: Use a human-started local bridge for host-side install, monitor, and debug access to a connected MicroPython MCU. Agents may use bridge client commands after a human starts it, but must never start or restart the bridge process themselves.
+---
+
 # MicroPython Debug Bridge
 
 Use this bridge when you need host-side install/monitor/debug access to the MicroPython runtime on the connected MCU.
 
+## Human-Owned Server Lifecycle
+
+- Never start or restart `mpy_debug_server.py`, `mpy_bridge.sh serve`, or an
+  equivalent bridge server process yourself.
+- If the bridge is unavailable, tell the human how to start it and wait for
+  them to confirm that it is running. Do not execute the start command.
+- Use bridge client commands only after the human has started the server.
+- Never call `mpy_bridge.sh stop` or `POST /shutdown` unless the human
+  explicitly asks you to shut down the bridge.
+- Before an explicitly requested shutdown, warn the human that only they may
+  start the bridge again and that subsequent bridge work will remain blocked
+  until they do.
+- After changing bridge server scripts, tell the human that they must manually
+  stop and restart the bridge for the changes to take effect.
+
 ## Entry Point
 
-Use the bundled CLI. It owns both server startup and client commands:
+Use the bundled CLI for client commands:
 
 ```bash
 "$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh help
 ```
 
-## Start Server
+## Human Start Instructions
 
-Start the server with the connected serial port. The server does not infer project files from its working directory.
+When the bridge is unavailable, give the human this command. Do not run it:
 
 ```bash
 "$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh serve --serial-port /dev/cu.usbmodem1101
 ```
 
-Use the `/dev/cu.*` serial device on macOS when available.
-
-Non-interactive starts automatically detach so the bridge survives the command
-runner's time limit. Use `--daemon` to request that explicitly, or
-`--foreground` when a supervisor must own the attached process. Stop a detached
-server with:
-
-```bash
-"$HOME"/.codex/skills/micropython-debug-bridge/scripts/mpy_bridge.sh stop
-```
+Ask the human to replace the example port with the connected device. Recommend
+the `/dev/cu.*` serial device on macOS when available. The server does not infer
+project files from its working directory.
 
 Listener-loop errors and final diagnostic snapshots are stored in
 `mpy-bridge-logs/server-8765.log`; detached server output is written there as
@@ -67,7 +80,6 @@ Common commands:
 
 ## Guidance
 
-- Ask for the bridge server to be restarted after editing the skill's bridge scripts.
 - Use `install-and-monitor --runtime` when you need the debug runtime installed and active immediately.
 - When calling the HTTP API directly, send install files as absolute paths in the `files` array.
 - Prefer `call app.get_state` over ad hoc parsing of logs when you need structured app state.
