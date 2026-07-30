@@ -2,6 +2,16 @@
 
 Generic host-side bridge for MicroPython projects. A human starts the server with access to a specific serial port; agents and scripts then use the HTTP/CLI bridge to install files, reset the MCU, monitor serial output, and call the optional on-device debug runtime.
 
+## Features
+
+This bridge and skill makes it possible for an LLM to:
+
+1. Install **micropython** files to an **MCU** (ESP32, RP2040, etc)
+2. Monitor program output
+3. Install a runtime which adds support for:
+  - Inspect threads variables
+  - Run functions
+
 ## Install
 
 Clone the repository into your personal Codex skills directory:
