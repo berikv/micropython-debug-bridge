@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "micropython": {
+      "command": "python3",
+      "args": [
+        "scripts/mpy_mcp_server.py"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "MPY_SERIAL_PORT"
+      ]
+    }
+  }
+}

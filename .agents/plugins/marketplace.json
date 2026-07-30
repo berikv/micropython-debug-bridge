@@ -1,0 +1,20 @@
+{
+  "name": "micropython-debug-bridge",
+  "interface": {
+    "displayName": "MicroPython Debug Bridge"
+  },
+  "plugins": [
+    {
+      "name": "micropython-debug-bridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/micropython-debug-bridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
