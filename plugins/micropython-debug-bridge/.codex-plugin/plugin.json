@@ -1,20 +1,22 @@
 {
   "name": "micropython-debug-bridge",
-  "version": "1.0.1",
-  "description": "Direct MCP access to connected MicroPython serial devices",
+  "version": "1.1.0",
+  "description": "Direct MCP access to MicroPython devices over serial and OTA",
   "author": {
     "name": "Berik Vissers"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "MicroPython Debug Bridge",
-    "shortDescription": "Control a MicroPython MCU over its host serial device.",
-    "longDescription": "Lists and selects macOS /dev/cu.* devices, installs MicroPython files, monitors serial output, resets the MCU, and exposes structured runtime debugging through a local stdio MCP server.",
+    "shortDescription": "Control MicroPython MCUs over serial and local-network OTA.",
+    "longDescription": "Discovers and identifies multiple MicroPython devices, installs files over macOS serial or authenticated local-network OTA, monitors serial output, resets MCUs, and exposes structured runtime debugging through a local stdio MCP server.",
     "developerName": "Berik Vissers",
     "category": "Developer Tools",
     "capabilities": [
       "Serial device discovery",
       "MicroPython file installation",
+      "OTA device discovery and installation",
+      "Stable MCU identity",
       "Serial monitoring",
       "Runtime debugging"
     ],

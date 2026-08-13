@@ -1,6 +1,6 @@
 ---
 name: micropython-debug-bridge
-description: Use the plugin-provided MCP tools for direct host-side install, serial monitoring, and runtime debugging of a connected MicroPython MCU. Use when an agent needs to discover or select a macOS /dev/cu.* device, copy MicroPython files, read serial output, reset the MCU, or call the optional on-device debug runtime.
+description: Use the plugin-provided MCP tools for direct host-side serial and OTA installation, device discovery, serial monitoring, and runtime debugging of MicroPython MCUs. Use when an agent needs to discover or identify devices, select a macOS /dev/cu.* device or OTA target, copy MicroPython files, read serial output, reset an MCU, provision WiFi OTA, or call the optional on-device debug runtime.
 ---
 
 # MicroPython Debug Bridge
@@ -35,6 +35,53 @@ Never invent a device path. A path must be returned by `list_serial_ports`;
 selection verifies the host's read/write permissions. `start_serial_monitor`
 then verifies that the MCP process can actually open and exclusively own it.
 
+Serial paths are temporary locations. To identify the physical MCU, call
+`identify_serial_device` after selecting it. Record the returned stable
+`device_id` (`machine.unique_id()`), friendly `name`, and station `mac`.
+
+## OTA Devices
+
+- OTA must first be provisioned over a selected serial port with
+  `provision_ota`. Explain that this writes WiFi credentials, device name, and
+  token to the MCU and installs `codex_ota.py`.
+- The application must instantiate `OTAService`, call `connect()`, and call
+  `poll()` frequently. Provisioning does not modify `main.py`; install an
+  OTA-aware application over serial during bootstrap. If the application does
+  not poll, the MCU will not appear in discovery.
+- Before every OTA operation, call `list_ota_devices`. If necessary, use the
+  subnet broadcast address instead of `255.255.255.255`.
+- Select only an exact `device_id` returned by that discovery with
+  `select_ota_device`. Never select by friendly name alone; names can collide.
+- Compare `device_id` from `identify_serial_device` and `list_ota_devices` to
+  correlate the serial and network views. MAC and name are secondary checks;
+  serial paths and DHCP addresses can change.
+- Use `install_files_ota` for frequently changing application files. Supply
+  the provisioned token and normally leave `restart: true`.
+- After a resetting update, call `list_ota_devices` again and confirm the same
+  `device_id` returns. This is the basic post-deployment health check.
+- Discovery supports multiple MCUs. Refresh it immediately before deployment
+  so the selected registry contains the current network endpoint.
+- OTA is a trusted-LAN transport with a pre-shared token and SHA-256 integrity,
+  not encrypted transport. Never expose its UDP/TCP ports to the internet.
+- If an application stops polling OTA or an update prevents boot, OTA is no
+  longer reachable. Do not repeatedly retry OTA. Return to USB, rediscover and
+  select an exact serial port, call `identify_serial_device`, require its
+  `device_id` to match the intended MCU, then repair `main.py` with
+  `install_files` or rerun `provision_ota` if configuration is wrong.
+
+Application integration:
+
+```python
+from codex_ota import OTAService
+
+ota = OTAService()
+ota.connect()
+
+while True:
+    ota.poll()
+    run_one_application_iteration()
+```
+
 ## Typical Workflow
 
 - Use `install_files` with absolute host paths. Set
@@ -62,6 +109,10 @@ then verifies that the MCP process can actually open and exclusively own it.
 `install_files`, `install_debug_runtime`, `remove_debug_runtime`,
 `reset_device`, and `evaluate_runtime` modify device state. Explain the intended
 operation when requesting approval.
+
+`identify_serial_device` interrupts and resets the selected MCU.
+`provision_ota` and `install_files_ota` modify device files and reset by
+default; explain the exact target identity and files before requesting approval.
 
 ## Runtime Integration
 

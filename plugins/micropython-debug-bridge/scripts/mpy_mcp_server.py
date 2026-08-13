@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import select
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -22,7 +25,7 @@ from typing import Any, Callable
 
 
 SERVER_NAME = "micropython-debug-bridge"
-SERVER_VERSION = "1.0.1"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {
     "2024-11-05",
@@ -44,6 +47,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PLUGIN_DIR = SCRIPT_DIR.parent
 DEBUG_RUNTIME_PATH = SCRIPT_DIR / "codex_debug_runtime.py"
 DEBUG_RUNTIME_NAME = DEBUG_RUNTIME_PATH.name
+OTA_RUNTIME_PATH = SCRIPT_DIR / "codex_ota.py"
+OTA_RUNTIME_NAME = OTA_RUNTIME_PATH.name
+OTA_CONFIG_NAME = "codex_ota.json"
+OTA_DISCOVERY_MAGIC = b"MPY_OTA_DISCOVER_V1"
+OTA_PROTOCOL = "mpy-ota-v1"
+OTA_DISCOVERY_PORT = 8266
+OTA_SERVICE_PORT = 8267
+OTA_HEADER_LIMIT = 16384
+OTA_DISCOVERY_TIMEOUT_SEC = 2.0
 MACOS_SERIAL_GLOB = "/dev/cu.*"
 LINUX_SERIAL_GLOBS = ("/dev/ttyACM*", "/dev/ttyUSB*")
 
@@ -162,6 +174,71 @@ def validate_serial_port(path: str) -> str:
             "and restart Codex so the MCP server inherits it"
         )
     return path
+
+
+def _validate_timeout(value: Any, *, maximum: float = 30.0) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("timeout_sec must be a number")
+    result = float(value)
+    if result <= 0 or result > maximum:
+        raise ValueError(f"timeout_sec must be greater than 0 and at most {maximum}")
+    return result
+
+
+def discover_ota_devices(
+    *,
+    timeout_sec: float = OTA_DISCOVERY_TIMEOUT_SEC,
+    broadcast: str = "255.255.255.255",
+) -> list[dict[str, Any]]:
+    """Discover OTA agents on one broadcast domain."""
+    timeout_sec = _validate_timeout(timeout_sec, maximum=10.0)
+    if not isinstance(broadcast, str) or not broadcast:
+        raise ValueError("broadcast must be a non-empty IPv4 address")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    devices: dict[str, dict[str, Any]] = {}
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("", 0))
+        sock.sendto(OTA_DISCOVERY_MAGIC, (broadcast, OTA_DISCOVERY_PORT))
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                payload, source = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            try:
+                item = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(item, dict) or item.get("protocol") != OTA_PROTOCOL:
+                continue
+            device_id = item.get("device_id")
+            port = item.get("port")
+            if not isinstance(device_id, str) or not device_id:
+                continue
+            if (
+                not isinstance(port, int)
+                or isinstance(port, bool)
+                or not 1 <= port <= 65535
+            ):
+                continue
+            devices[device_id] = {
+                "device_id": device_id,
+                "name": item.get("name") or device_id,
+                "mac": item.get("mac"),
+                "host": source[0],
+                "port": port,
+                "protocol": OTA_PROTOCOL,
+            }
+    finally:
+        sock.close()
+    return sorted(
+        devices.values(), key=lambda item: (item["name"], item["device_id"])
+    )
 
 
 def configure_serial_fd(serial_fd: int) -> None:
@@ -607,6 +684,8 @@ class DeviceController:
         self.runner = CommandRunner()
         self._operation_lock = threading.RLock()
         self._selected_port = os.environ.get("MPY_SERIAL_PORT")
+        self._ota_devices: dict[str, dict[str, Any]] = {}
+        self._selected_ota_device: str | None = None
         self._last_device_control: dict[str, Any] | None = None
 
     def close(self) -> None:
@@ -659,6 +738,10 @@ class DeviceController:
             "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "selected_port": self._selected_port,
             "selected_port_available": selected_available,
+            "selected_ota_device": self._selected_ota_device,
+            "selected_ota_endpoint": self._ota_devices.get(
+                self._selected_ota_device or ""
+            ),
             "mpremote": shutil.which("mpremote"),
             "last_device_control": self._last_device_control,
             **self.monitor.snapshot(),
@@ -700,26 +783,238 @@ class DeviceController:
         diagnostics["mpremote_stdout"] = stdout
         return stdout
 
+    @staticmethod
+    def _checked_files(files: Any) -> list[Path]:
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty array of absolute paths")
+        checked: list[Path] = []
+        names: set[str] = set()
+        for item in files:
+            if not isinstance(item, str) or not os.path.isabs(item):
+                raise ValueError(f"install path must be absolute: {item!r}")
+            path = Path(item)
+            if not path.is_file():
+                raise ValueError(f"install file does not exist: {item}")
+            if path.name in names:
+                raise ValueError(f"duplicate destination basename: {path.name}")
+            names.add(path.name)
+            checked.append(path)
+        return checked
+
     def _reset(self, port: str) -> None:
         self._run_mpremote(port, ["connect", port, "reset"])
 
     def _install_paths(self, files: Any, port: str) -> dict[str, Any]:
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty array of absolute paths")
-        checked: list[str] = []
-        for item in files:
-            if not isinstance(item, str) or not os.path.isabs(item):
-                raise ValueError(f"install path must be absolute: {item!r}")
-            if not os.path.isfile(item):
-                raise ValueError(f"install file does not exist: {item}")
-            checked.append(item)
+        checked = self._checked_files(files)
         self._run_mpremote(
-            port, ["connect", port, "fs", "cp", *checked, ":"]
+            port, ["connect", port, "fs", "cp", *map(str, checked), ":"]
         )
         listing = self._run_mpremote(port, ["connect", port, "fs", "ls"])
         return {
-            "files": [os.path.basename(item) for item in checked],
+            "files": [item.name for item in checked],
             "listing": listing,
+        }
+
+    @staticmethod
+    def _serial_identity_program() -> str:
+        return (
+            "import machine\n"
+            "try:\n import ujson as json\nexcept ImportError:\n import json\n"
+            "uid=''.join('{:02x}'.format(x) for x in machine.unique_id())\n"
+            "name=None\nmac=None\n"
+            "try:\n"
+            f" c=json.loads(open({OTA_CONFIG_NAME!r}).read())\n"
+            " name=c.get('name')\n"
+            "except Exception:\n pass\n"
+            "try:\n"
+            " import network\n"
+            " w=network.WLAN(network.STA_IF)\n"
+            " mac=''.join('{:02x}'.format(x) for x in w.config('mac'))\n"
+            "except Exception:\n pass\n"
+            "print('@@MPY_ID@@'+json.dumps({'device_id':uid,'name':name or "
+            "'micropython-'+uid[-6:],'mac':mac}))\n"
+        )
+
+    def _identify_serial(self, port: str) -> dict[str, Any]:
+        output = self._run_mpremote(
+            port, ["connect", port, "exec", self._serial_identity_program()]
+        )
+        marker = "@@MPY_ID@@"
+        for line in reversed(output.splitlines()):
+            if marker in line:
+                value = json.loads(line.split(marker, 1)[1])
+                if isinstance(value, dict) and value.get("device_id"):
+                    return value
+        raise RuntimeError("MCU identity marker was not returned by mpremote")
+
+    def identify_serial(self, _: dict[str, Any]) -> dict[str, Any]:
+        port = self._port()
+        with self._operation_lock:
+            self.monitor.stop_monitor()
+            identity = self._identify_serial(port)
+            self._reset(port)
+        return {"ok": True, "transport": "serial", "port": port, **identity}
+
+    def provision_ota(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        port = self._port()
+        values: dict[str, str] = {}
+        for key in ("ssid", "password", "name", "token"):
+            value = arguments.get(key)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{key} must be a non-empty string")
+            values[key] = value
+        if len(values["token"]) < 16:
+            raise ValueError("token must contain at least 16 characters")
+        ota_port = arguments.get("port", OTA_SERVICE_PORT)
+        if (
+            not isinstance(ota_port, int)
+            or isinstance(ota_port, bool)
+            or not 1 <= ota_port <= 65535
+        ):
+            raise ValueError("port must be an integer from 1 through 65535")
+        config = {**values, "port": ota_port}
+        encoded = json.dumps(config, separators=(",", ":"))
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="codex-ota-",
+                suffix=".json",
+                delete=False,
+            ) as temporary:
+                temporary.write(encoded)
+                temporary_path = temporary.name
+            with self._operation_lock:
+                self.monitor.stop_monitor()
+                self._run_mpremote(
+                    port,
+                    ["connect", port, "fs", "cp", str(OTA_RUNTIME_PATH), ":"],
+                )
+                self._run_mpremote(
+                    port,
+                    [
+                        "connect",
+                        port,
+                        "fs",
+                        "cp",
+                        temporary_path,
+                        f":{OTA_CONFIG_NAME}",
+                    ],
+                )
+                identity = self._identify_serial(port)
+                self._reset(port)
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+        return {
+            "ok": True,
+            "transport": "serial",
+            "port": port,
+            "installed": [OTA_RUNTIME_NAME, OTA_CONFIG_NAME],
+            "ota_port": ota_port,
+            **identity,
+        }
+
+    def list_ota_devices(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        timeout_sec = _validate_timeout(
+            arguments.get("timeout_sec", OTA_DISCOVERY_TIMEOUT_SEC), maximum=10.0
+        )
+        broadcast = arguments.get("broadcast", "255.255.255.255")
+        devices = discover_ota_devices(
+            timeout_sec=timeout_sec, broadcast=broadcast
+        )
+        self._ota_devices = {item["device_id"]: item for item in devices}
+        if self._selected_ota_device not in self._ota_devices:
+            self._selected_ota_device = None
+        for item in devices:
+            item["selected"] = item["device_id"] == self._selected_ota_device
+        return {
+            "ok": True,
+            "devices": devices,
+            "selected_device_id": self._selected_ota_device,
+            "broadcast": broadcast,
+        }
+
+    def select_ota_device(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        device_id = arguments.get("device_id")
+        if not isinstance(device_id, str) or not device_id:
+            raise ValueError("device_id must be a non-empty string")
+        device = self._ota_devices.get(device_id)
+        if device is None:
+            raise ValueError(
+                "device_id was not returned by the latest list_ota_devices call"
+            )
+        self._selected_ota_device = device_id
+        return {"ok": True, "selected_device": device}
+
+    def install_files_ota(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self._selected_ota_device is None:
+            raise RuntimeError(
+                "no OTA device selected; call list_ota_devices, then "
+                "select_ota_device with an exact device_id"
+            )
+        device = self._ota_devices.get(self._selected_ota_device)
+        if device is None:
+            raise RuntimeError("selected OTA device is no longer in the registry")
+        token = arguments.get("token")
+        if not isinstance(token, str) or len(token) < 16:
+            raise ValueError("token must contain at least 16 characters")
+        checked = self._checked_files(arguments.get("files"))
+        timeout_sec = _validate_timeout(
+            arguments.get("timeout_sec", 30), maximum=120.0
+        )
+        metadata = []
+        for path in checked:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            metadata.append(
+                {
+                    "name": path.name,
+                    "size": path.stat().st_size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        request = {
+            "protocol": OTA_PROTOCOL,
+            "op": "install",
+            "token": token,
+            "restart": bool(arguments.get("restart", True)),
+            "files": metadata,
+        }
+        with self._operation_lock:
+            with socket.create_connection(
+                (device["host"], device["port"]), timeout=timeout_sec
+            ) as connection:
+                connection.settimeout(timeout_sec)
+                connection.sendall(
+                    json.dumps(request, separators=(",", ":")).encode("utf-8")
+                    + b"\n"
+                )
+                for path in checked:
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(65536), b""):
+                            connection.sendall(chunk)
+                with connection.makefile("rb") as response_file:
+                    response_line = response_file.readline(OTA_HEADER_LIMIT + 1)
+                if not response_line or len(response_line) > OTA_HEADER_LIMIT:
+                    raise RuntimeError("invalid or missing OTA response")
+                response = json.loads(response_line.decode("utf-8"))
+        if not response.get("ok"):
+            raise RuntimeError(
+                f"OTA install failed: {response.get('error', 'unknown error')}"
+            )
+        return {
+            "ok": True,
+            "transport": "ota",
+            "device": device,
+            "files": [item["name"] for item in metadata],
+            "restart": request["restart"],
         }
 
     def _install_runtime(self, port: str) -> dict[str, Any]:
@@ -927,6 +1222,122 @@ class MCPServer:
                 idempotent=True,
             ),
             _tool(
+                "identify_serial_device",
+                "Identify serial device",
+                "Read the selected MCU's stable machine unique ID, configured "
+                "friendly name, and WiFi MAC address. This temporarily enters "
+                "the REPL, resets the MCU, and leaves monitoring stopped.",
+                _object_schema(),
+                self.controller.identify_serial,
+                read_only=False,
+                idempotent=True,
+            ),
+            _tool(
+                "provision_ota",
+                "Provision OTA over serial",
+                "Install the OTA helper and WiFi configuration on the selected "
+                "serial MCU. The application must instantiate OTAService, call "
+                "connect(), and poll it. Resets the MCU when complete.",
+                _object_schema(
+                    {
+                        "ssid": {"type": "string", "minLength": 1},
+                        "password": {"type": "string", "minLength": 1},
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Adjustable human-friendly device name.",
+                        },
+                        "token": {
+                            "type": "string",
+                            "minLength": 16,
+                            "description": (
+                                "Pre-shared OTA token (at least 16 characters)."
+                            ),
+                        },
+                        "port": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 65535,
+                            "default": OTA_SERVICE_PORT,
+                        },
+                    },
+                    ["ssid", "password", "name", "token"],
+                ),
+                self.controller.provision_ota,
+                read_only=False,
+                destructive=True,
+            ),
+            _tool(
+                "list_ota_devices",
+                "List OTA devices",
+                "Broadcast on the local network and list responding MicroPython "
+                "OTA devices by stable device ID, friendly name, MAC, and endpoint.",
+                _object_schema(
+                    {
+                        "timeout_sec": {
+                            "type": "number",
+                            "minimum": 0.001,
+                            "maximum": 10,
+                            "default": OTA_DISCOVERY_TIMEOUT_SEC,
+                        },
+                        "broadcast": {
+                            "type": "string",
+                            "default": "255.255.255.255",
+                            "description": (
+                                "IPv4 broadcast address; use the subnet "
+                                "broadcast if needed."
+                            ),
+                        },
+                    }
+                ),
+                self.controller.list_ota_devices,
+                read_only=True,
+                idempotent=True,
+            ),
+            _tool(
+                "select_ota_device",
+                "Select OTA device",
+                "Select an exact stable device_id returned by the latest "
+                "list_ota_devices call.",
+                _object_schema(
+                    {"device_id": {"type": "string", "minLength": 1}},
+                    ["device_id"],
+                ),
+                self.controller.select_ota_device,
+                read_only=False,
+                idempotent=True,
+            ),
+            _tool(
+                "install_files_ota",
+                "Install files over OTA",
+                "Stream absolute host file paths to the selected OTA MCU, verify "
+                "SHA-256 on-device, replace root-level files, and optionally reset.",
+                _object_schema(
+                    {
+                        "files": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"},
+                            "description": (
+                                "Absolute host paths; basenames become MCU filenames."
+                            ),
+                        },
+                        "token": {"type": "string", "minLength": 16},
+                        "restart": {"type": "boolean", "default": True},
+                        "timeout_sec": {
+                            "type": "number",
+                            "minimum": 0.001,
+                            "maximum": 120,
+                            "default": 30,
+                        },
+                    },
+                    ["files", "token"],
+                ),
+                self.controller.install_files_ota,
+                read_only=False,
+                destructive=True,
+            ),
+            _tool(
                 "get_bridge_status",
                 "Get bridge status",
                 "Report the selected device, monitor state, last serial error, "
@@ -1097,10 +1508,11 @@ class MCPServer:
                         "version": SERVER_VERSION,
                     },
                     "instructions": (
-                        "First call list_serial_ports, then select_serial_port "
-                        "with an exact /dev/cu.* path. This MCP process has direct "
-                        "host TTY access; do not use shell scripts, curl, or "
-                        "localhost HTTP."
+                        "For USB, first call list_serial_ports and select_serial_port "
+                        "with an exact /dev/cu.* path. For OTA, first call "
+                        "list_ota_devices and select_ota_device with an exact stable "
+                        "device_id. This MCP process has direct host TTY and LAN "
+                        "access; do not use shell scripts, curl, or localhost HTTP."
                     ),
                 }
             elif method == "ping":

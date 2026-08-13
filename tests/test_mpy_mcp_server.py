@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import pty
@@ -84,6 +85,99 @@ class SerialDiscoveryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PermissionError, "restart Codex"):
             controller.select_port({"port": "/dev/cu.usbmodem11201"})
+
+
+class OTADeviceTests(unittest.TestCase):
+    def setUp(self):
+        self.controller = SERVER.DeviceController()
+
+    def tearDown(self):
+        self.controller.close()
+
+    @mock.patch.object(SERVER, "discover_ota_devices")
+    def test_discovers_and_selects_multiple_devices_by_stable_id(self, discover):
+        discover.return_value = [
+            {
+                "device_id": "aabbcc01",
+                "name": "reader-kitchen",
+                "mac": "001122334455",
+                "host": "192.0.2.10",
+                "port": 8267,
+                "protocol": SERVER.OTA_PROTOCOL,
+            },
+            {
+                "device_id": "aabbcc02",
+                "name": "reader-lab",
+                "mac": "001122334466",
+                "host": "192.0.2.11",
+                "port": 8267,
+                "protocol": SERVER.OTA_PROTOCOL,
+            },
+        ]
+
+        result = self.controller.list_ota_devices({"timeout_sec": 0.1})
+        selected = self.controller.select_ota_device({"device_id": "aabbcc02"})
+
+        self.assertEqual(len(result["devices"]), 2)
+        self.assertEqual(selected["selected_device"]["name"], "reader-lab")
+        with self.assertRaisesRegex(ValueError, "latest list_ota_devices"):
+            self.controller.select_ota_device({"device_id": "missing"})
+
+    def test_serial_identity_program_is_valid_python(self):
+        compile(self.controller._serial_identity_program(), "<identity>", "exec")
+
+    @mock.patch.object(SERVER.socket, "create_connection")
+    def test_ota_install_streams_header_and_file_with_hash(self, connect):
+        class FakeConnection:
+            def __init__(self):
+                self.sent = bytearray()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def settimeout(self, _):
+                pass
+
+            def sendall(self, data):
+                self.sent.extend(data)
+
+            def makefile(self, _):
+                return io.BytesIO(b'{"ok":true}\n')
+
+        connection = FakeConnection()
+        connect.return_value = connection
+        self.controller._ota_devices = {
+            "aabbcc01": {
+                "device_id": "aabbcc01",
+                "name": "reader-kitchen",
+                "mac": "001122334455",
+                "host": "192.0.2.10",
+                "port": 8267,
+                "protocol": SERVER.OTA_PROTOCOL,
+            }
+        }
+        self.controller._selected_ota_device = "aabbcc01"
+        source = SERVER.DEBUG_RUNTIME_PATH
+        result = self.controller.install_files_ota(
+            {
+                "files": [str(source)],
+                "token": "0123456789abcdef",
+                "restart": False,
+            }
+        )
+
+        header, body = bytes(connection.sent).split(b"\n", 1)
+        request = json.loads(header)
+        self.assertEqual(body, source.read_bytes())
+        self.assertEqual(
+            request["files"][0]["sha256"],
+            SERVER.hashlib.sha256(body).hexdigest(),
+        )
+        self.assertEqual(request["files"][0]["size"], len(body))
+        self.assertEqual(result["transport"], "ota")
 
 
 class MonitorTests(unittest.TestCase):
@@ -324,6 +418,11 @@ class MCPProtocolTests(unittest.TestCase):
 
         self.assertIn("list_serial_ports", tools)
         self.assertIn("select_serial_port", tools)
+        self.assertIn("identify_serial_device", tools)
+        self.assertIn("provision_ota", tools)
+        self.assertIn("list_ota_devices", tools)
+        self.assertIn("select_ota_device", tools)
+        self.assertIn("install_files_ota", tools)
         self.assertEqual(
             tools["select_serial_port"]["inputSchema"]["properties"]["port"][
                 "pattern"

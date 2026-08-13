@@ -1,7 +1,7 @@
 # MicroPython Debug Bridge
 
-A Codex plugin that gives agents direct, structured access to a connected
-MicroPython MCU through a local stdio MCP server.
+A Codex plugin that gives agents direct, structured access to MicroPython MCUs
+over USB serial and local-network OTA through a stdio MCP server.
 
 The MCP server is launched by the Codex host, outside the agent command
 sandbox. It opens the selected TTY itself, so it does not depend on localhost,
@@ -20,12 +20,19 @@ sandbox. It opens the selected TTY itself, so it does not depend on localhost,
   exported function calls, and focused expression or statement evaluation.
 - Keeps serial access in one MCP process and serializes runtime requests.
 - Retains takeover RX/TX evidence when raw REPL cannot be entered.
+- Provisions a small polling OTA service and WiFi settings over serial.
+- Discovers multiple OTA-capable MCUs by stable hardware ID, friendly name,
+  station MAC address, and current IP endpoint.
+- Streams application files over WiFi, verifies SHA-256 on the MCU, and resets
+  into the new application.
 - Has no network listener and no MCP shutdown tool.
 
 ## Requirements
 
 - macOS with a USB serial device exposed as `/dev/cu.*`.
 - Python 3 available as `python3`.
+- A network-capable MicroPython board for OTA, such as a Pico W, with the Codex
+  OTA service polled by its application.
 - [`mpremote`](https://docs.micropython.org/en/latest/reference/mpremote.html)
   on the Codex host `PATH` for file installation and device resets:
 
@@ -102,6 +109,11 @@ workflow because macOS device suffixes can change after reconnecting USB.
 | --- | --- |
 | `list_serial_ports` | List supported connected devices and access status. |
 | `select_serial_port` | Select an exact discovered `/dev/cu.*` path. |
+| `identify_serial_device` | Read the selected MCU's stable ID, friendly name, and WiFi MAC. |
+| `provision_ota` | Install the OTA helper and WiFi/device configuration over serial. |
+| `list_ota_devices` | Discover all responding OTA MCUs on the local network. |
+| `select_ota_device` | Select one exact stable device ID from OTA discovery. |
+| `install_files_ota` | Upload files to the selected MCU, verify them, and optionally reset. |
 | `get_bridge_status` | Show selection, monitor state, `mpremote`, and the last device-control evidence. |
 | `install_files` | Copy absolute host paths and optionally install the runtime. |
 | `install_debug_runtime` | Install the bundled on-device helper. |
@@ -134,6 +146,109 @@ stuck in native code or hardware that requires an external reset.
    reads.
 6. If structured debugging is needed, install the runtime and use
    `get_runtime_state` or `call_runtime_function`.
+
+This is also the serial application-programming workflow: `install_files`
+copies the selected absolute host files to the MCU root, resets the device, and
+normally starts serial monitoring. Always rediscover and identify the physical
+serial device before writing when more than one MCU is connected.
+
+## Device Identity
+
+Serial device paths and IP addresses are temporary locations, not identities.
+macOS can assign a different `/dev/cu.usbmodem*` suffix after a reconnect, and
+DHCP can change an IP address.
+
+The plugin uses these fields:
+
+- `device_id`: lowercase hexadecimal `machine.unique_id()`. This is the stable,
+  authoritative identifier used by `select_ota_device`.
+- `name`: an adjustable, human-friendly label such as `reader-kitchen`. Names
+  need not be unique and must not be used alone to select a target.
+- `mac`: the station-interface MAC address, useful as a second physical check.
+- `port` or `host`: the current serial or network location.
+
+To correlate USB and OTA, select a serial port and call
+`identify_serial_device`. After provisioning and starting the application,
+call `list_ota_devices`. Match the identical `device_id`; the MAC and friendly
+name provide additional confirmation.
+
+## Enable OTA Over Serial
+
+Serial is the initial provisioning and recovery transport. In a new Codex task:
+
+1. Call `list_serial_ports` and select an exact returned path.
+2. Call `identify_serial_device` and record its `device_id` and `mac`.
+3. Call `provision_ota` with the WiFi SSID, password, a unique friendly name,
+   and a random pre-shared token of at least 16 characters.
+4. Integrate and install an application that starts and polls `OTAService`.
+
+The provisioning tool writes `/codex_ota.py` and `/codex_ota.json`, then resets
+the board. The JSON file resembles this, but normally let the tool create it:
+
+```json
+{
+  "ssid": "workshop-wifi",
+  "password": "replace-me",
+  "name": "reader-kitchen",
+  "token": "replace-with-a-long-random-token",
+  "port": 8267
+}
+```
+
+The application must service OTA regularly. A typical `main.py` is:
+
+```python
+from codex_ota import OTAService
+
+ota = OTAService()
+ota.connect()
+
+while True:
+    ota.poll()
+    run_one_application_iteration()
+```
+
+Keep each application iteration short enough to call `ota.poll()` regularly.
+The upload itself is synchronous and pauses the application until its files
+have arrived. `OTA READY ...` on serial reports the same ID, name, MAC, and IP
+returned by network discovery.
+
+To change WiFi credentials, the friendly name, token, or OTA port, run
+`provision_ota` over serial again. The hardware `device_id` does not change.
+
+## Install Application Files Over OTA
+
+Once the provisioned application is running:
+
+1. Call `list_ota_devices`. Discovery uses UDP port 8266 on the local broadcast
+   domain. If the all-hosts address does not work, pass the subnet broadcast,
+   for example `192.168.1.255`.
+2. Compare `device_id`, name, MAC, and IP, then call `select_ota_device` with the
+   exact `device_id` returned by discovery.
+3. Call `install_files_ota` with absolute host paths and the device's token.
+   Basenames become root-level MCU filenames.
+4. Leave `restart: true` for application updates. The MCU verifies every file's
+   SHA-256 before replacing it and resets after reporting success.
+5. Call `list_ota_devices` again and confirm that the same `device_id` returns.
+   This verifies that the updated application booted, connected, and resumed
+   polling OTA.
+
+Repeat discovery immediately before each deployment: it refreshes DHCP
+addresses and proves that the target currently responds. Multiple MCUs may
+share the same WiFi and discovery ports; each responds with its own stable ID.
+
+### OTA Security and Recovery
+
+The compact OTA protocol is intended for a trusted local network. Its token
+prevents accidental or unauthenticated writes, and SHA-256 detects corrupted
+transfers, but traffic and credentials are not encrypted. Use an isolated or
+trusted WiFi network; do not expose ports 8266/8267 to the internet.
+
+Files are downloaded to temporary names and verified before replacement. This
+simple implementation does not provide a transactional multi-file rollback:
+power loss while replacing several files can leave a mixed version. Upload
+supporting modules before `main.py`, keep serial recovery available, and use
+USB serial if the application no longer starts or polls OTA.
 
 ## On-Device Runtime
 
@@ -172,6 +287,7 @@ plugins/micropython-debug-bridge/
   skills/micropython-debug-bridge/SKILL.md
   scripts/mpy_mcp_server.py
   scripts/codex_debug_runtime.py
+  scripts/codex_ota.py
 tests/test_mpy_mcp_server.py
 ```
 
